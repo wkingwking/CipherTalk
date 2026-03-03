@@ -14,6 +14,7 @@ import AgreementPage from './pages/AgreementPage'
 import GroupAnalyticsPage from './pages/GroupAnalyticsPage'
 import DataManagementPage from './pages/DataManagementPage'
 import SettingsPage from './pages/SettingsPage'
+import OpenApiPage from './pages/OpenApiPage'
 import ExportPage from './pages/ExportPage'
 import ActivationPage from './pages/ActivationPage'
 import ImageWindow from './pages/ImageWindow'
@@ -482,7 +483,9 @@ function App() {
 
       <div className="main-layout">
         <Sidebar />
-        <main className={`content ${location.pathname === '/data-management' ? 'no-overflow' : ''}`}>
+        <main
+          className={`content ${['/data-management', '/settings', '/open-api'].includes(location.pathname) ? 'no-overflow' : ''}`}
+        >
           <RouteGuard>
             <Routes>
               <Route path="/" element={<WelcomePage />} />
@@ -491,6 +494,7 @@ function App() {
               <Route path="/annual-report" element={<AnnualReportPage />} />
               <Route path="/data-management" element={<DataManagementPage />} />
               <Route path="/settings" element={<SettingsPage />} />
+              <Route path="/open-api" element={<OpenApiPage />} />
               <Route path="/export" element={<ExportPage />} />
               <Route path="/chat-history/:sessionId/:messageId" element={<ChatHistoryPage />} />
             </Routes>

@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { NavLink, useLocation } from 'react-router-dom'
-import { Home, MessageSquare, BarChart3, Users, FileText, Database, Settings, SquareChevronLeft, SquareChevronRight, Download, Aperture } from 'lucide-react'
+import { Home, MessageSquare, BarChart3, Users, FileText, Database, Settings, SquareChevronLeft, SquareChevronRight, Download, Aperture, Network } from 'lucide-react'
 import './Sidebar.scss'
 
 function Sidebar() {
@@ -116,6 +116,16 @@ function Sidebar() {
         >
           <span className="nav-icon"><Database size={20} /></span>
           <span className="nav-label">数据管理</span>
+        </NavLink>
+
+        {/* 开放接口 */}
+        <NavLink
+          to="/open-api"
+          className={`nav-item ${isActive('/open-api') ? 'active' : ''}`}
+          title={collapsed ? '开放接口' : undefined}
+        >
+          <span className="nav-icon"><Network size={20} /></span>
+          <span className="nav-label">开放接口</span>
         </NavLink>
       </nav>
       

@@ -2,6 +2,7 @@ import * as http from 'http'
 import { URL } from 'url'
 import { app } from 'electron'
 import { ConfigService } from './config'
+import { chatService } from './chatService'
 
 interface ApiEnvelopeSuccess<T> {
   success: true
@@ -31,6 +32,9 @@ interface HttpApiSettings {
   port: number
   token: string
 }
+
+type ContactType = 'friend' | 'group' | 'official' | 'former_friend' | 'other'
+type SessionTypeFilter = 'friend' | 'group' | 'official' | 'other'
 
 class HttpApiService {
   private server: http.Server | null = null
@@ -133,7 +137,9 @@ class HttpApiService {
       endpoints: [
         { method: 'GET', path: '/v1', desc: '接口详情' },
         { method: 'GET', path: '/v1/health', desc: '健康检查' },
-        { method: 'GET', path: '/v1/status', desc: '服务状态' }
+        { method: 'GET', path: '/v1/status', desc: '服务状态' },
+        { method: 'GET', path: '/v1/sessions', desc: '会话列表' },
+        { method: 'GET', path: '/v1/contacts', desc: '联系人列表' }
       ],
       lastError: this.startError
     }
@@ -218,6 +224,58 @@ class HttpApiService {
     return ''
   }
 
+  private parseBoolean(value: string | null, defaultValue: boolean): boolean {
+    if (value === null) return defaultValue
+    const normalized = value.trim().toLowerCase()
+    if (['1', 'true', 'yes', 'on'].includes(normalized)) return true
+    if (['0', 'false', 'no', 'off'].includes(normalized)) return false
+    return defaultValue
+  }
+
+  private parseIntInRange(value: string | null, defaultValue: number, min: number, max: number): number {
+    if (!value) return defaultValue
+    const n = Number.parseInt(value, 10)
+    if (!Number.isFinite(n)) return defaultValue
+    return Math.max(min, Math.min(max, n))
+  }
+
+  private parseTypeFilter(value: string | null): Set<ContactType> | null {
+    if (!value) return null
+    const allowed: ContactType[] = ['friend', 'group', 'official', 'former_friend', 'other']
+    const result = new Set<ContactType>()
+    value
+      .split(',')
+      .map((x) => x.trim().toLowerCase())
+      .forEach((x) => {
+        if (allowed.includes(x as ContactType)) {
+          result.add(x as ContactType)
+        }
+      })
+    return result.size > 0 ? result : null
+  }
+
+  private parseSessionTypeFilter(value: string | null): Set<SessionTypeFilter> | null {
+    if (!value) return null
+    const allowed: SessionTypeFilter[] = ['friend', 'group', 'official', 'other']
+    const result = new Set<SessionTypeFilter>()
+    value
+      .split(',')
+      .map((x) => x.trim().toLowerCase())
+      .forEach((x) => {
+        if (allowed.includes(x as SessionTypeFilter)) {
+          result.add(x as SessionTypeFilter)
+        }
+      })
+    return result.size > 0 ? result : null
+  }
+
+  private detectSessionType(username: string): SessionTypeFilter {
+    if (username.includes('@chatroom')) return 'group'
+    if (username.startsWith('gh_')) return 'official'
+    if (username) return 'friend'
+    return 'other'
+  }
+
   private async handleRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     this.handleCors(res)
 
@@ -257,6 +315,14 @@ class HttpApiService {
     }
     if (pathname === '/api/v1/status') {
       this.sendRedirect(res, '/v1/status')
+      return
+    }
+    if (pathname === '/api/v1/sessions') {
+      this.sendRedirect(res, '/v1/sessions')
+      return
+    }
+    if (pathname === '/api/v1/contacts') {
+      this.sendRedirect(res, '/v1/contacts')
       return
     }
     if (pathname === '/') {
@@ -378,6 +444,175 @@ class HttpApiService {
           startedAt: this.startedAt ? new Date(this.startedAt).toISOString() : '',
           lastError: this.startError
         }
+      }))
+      return
+    }
+
+    if (pathname === '/v1/sessions') {
+      const q = (url.searchParams.get('q') || '').trim().toLowerCase()
+      const typeFilter = this.parseSessionTypeFilter(url.searchParams.get('type'))
+      const unreadOnly = this.parseBoolean(url.searchParams.get('unreadOnly'), false)
+      const sort = (url.searchParams.get('sort') || 'sortTimestamp_desc').trim()
+      const offset = this.parseIntInRange(url.searchParams.get('offset'), 0, 0, 100000)
+      const limit = this.parseIntInRange(url.searchParams.get('limit'), 100, 1, 500)
+
+      const sessionsResult = await chatService.getSessions()
+      if (!sessionsResult.success) {
+        this.sendJson(
+          res,
+          503,
+          this.failure(
+            requestId,
+            'DB_NOT_CONNECTED',
+            sessionsResult.error || 'Failed to read sessions',
+            'Please complete DB decrypt/setup in Settings and ensure data is available.'
+          )
+        )
+        return
+      }
+
+      let sessions = (sessionsResult.sessions || []).map((item) => {
+        const sessionType = this.detectSessionType(item.username || '')
+        return {
+          username: item.username,
+          displayName: item.displayName || item.username,
+          avatarUrl: item.avatarUrl,
+          summary: item.summary,
+          unreadCount: item.unreadCount || 0,
+          sortTimestamp: item.sortTimestamp || 0,
+          lastTimestamp: item.lastTimestamp || 0,
+          lastMsgType: item.lastMsgType || 0,
+          sessionType
+        }
+      })
+
+      if (typeFilter) {
+        sessions = sessions.filter((item) => typeFilter.has(item.sessionType))
+      }
+
+      if (unreadOnly) {
+        sessions = sessions.filter((item) => Number(item.unreadCount || 0) > 0)
+      }
+
+      if (q) {
+        sessions = sessions.filter((item) => {
+          const username = String(item.username || '').toLowerCase()
+          const displayName = String(item.displayName || '').toLowerCase()
+          const summary = String(item.summary || '').toLowerCase()
+          return username.includes(q) || displayName.includes(q) || summary.includes(q)
+        })
+      }
+
+      if (sort === 'name_asc') {
+        sessions.sort((a, b) => String(a.displayName || '').localeCompare(String(b.displayName || ''), 'zh-CN'))
+      } else if (sort === 'name_desc') {
+        sessions.sort((a, b) => String(b.displayName || '').localeCompare(String(a.displayName || ''), 'zh-CN'))
+      } else if (sort === 'lastTimestamp_asc') {
+        sessions.sort((a, b) => Number(a.lastTimestamp || 0) - Number(b.lastTimestamp || 0))
+      } else if (sort === 'lastTimestamp_desc') {
+        sessions.sort((a, b) => Number(b.lastTimestamp || 0) - Number(a.lastTimestamp || 0))
+      } else if (sort === 'unreadCount_desc') {
+        sessions.sort((a, b) => Number(b.unreadCount || 0) - Number(a.unreadCount || 0))
+      } else {
+        sessions.sort((a, b) => Number(b.sortTimestamp || 0) - Number(a.sortTimestamp || 0))
+      }
+
+      const total = sessions.length
+      const paged = sessions.slice(offset, offset + limit)
+      const hasMore = offset + paged.length < total
+
+      this.sendJson(res, 200, this.success(requestId, {
+        total,
+        offset,
+        limit,
+        hasMore,
+        sort,
+        filters: {
+          q,
+          type: typeFilter ? Array.from(typeFilter) : null,
+          unreadOnly
+        },
+        sessions: paged
+      }))
+      return
+    }
+
+    if (pathname === '/v1/contacts') {
+      const q = (url.searchParams.get('q') || '').trim().toLowerCase()
+      const typeFilter = this.parseTypeFilter(url.searchParams.get('type'))
+      const includeAvatar = this.parseBoolean(url.searchParams.get('includeAvatar'), true)
+      const sort = (url.searchParams.get('sort') || 'lastContactTime_desc').trim()
+      const offset = this.parseIntInRange(url.searchParams.get('offset'), 0, 0, 100000)
+      const limit = this.parseIntInRange(url.searchParams.get('limit'), 100, 1, 500)
+
+      const contactsResult = await chatService.getContacts()
+      if (!contactsResult.success) {
+        this.sendJson(
+          res,
+          503,
+          this.failure(
+            requestId,
+            'DB_NOT_CONNECTED',
+            contactsResult.error || 'Failed to read contacts',
+            'Please complete DB decrypt/setup in Settings and ensure data is available.'
+          )
+        )
+        return
+      }
+
+      let contacts = (contactsResult.contacts || []) as Array<Record<string, any>>
+
+      if (typeFilter) {
+        contacts = contacts.filter((item) => typeFilter.has((item.type || 'other') as ContactType))
+      }
+
+      if (q) {
+        contacts = contacts.filter((item) => {
+          const username = String(item.username || '').toLowerCase()
+          const displayName = String(item.displayName || '').toLowerCase()
+          const remark = String(item.remark || '').toLowerCase()
+          const nickname = String(item.nickname || '').toLowerCase()
+          return (
+            username.includes(q) ||
+            displayName.includes(q) ||
+            remark.includes(q) ||
+            nickname.includes(q)
+          )
+        })
+      }
+
+      if (sort === 'name_asc') {
+        contacts.sort((a, b) => String(a.displayName || '').localeCompare(String(b.displayName || ''), 'zh-CN'))
+      } else if (sort === 'name_desc') {
+        contacts.sort((a, b) => String(b.displayName || '').localeCompare(String(a.displayName || ''), 'zh-CN'))
+      } else if (sort === 'lastContactTime_asc') {
+        contacts.sort((a, b) => Number((a as any).lastContactTime || 0) - Number((b as any).lastContactTime || 0))
+      } else {
+        contacts.sort((a, b) => Number((b as any).lastContactTime || 0) - Number((a as any).lastContactTime || 0))
+      }
+
+      const total = contacts.length
+      const paged = contacts.slice(offset, offset + limit)
+      const hasMore = offset + paged.length < total
+
+      const finalContacts = paged.map((item) => {
+        if (includeAvatar) return item
+        const { avatarUrl, ...rest } = item
+        return rest
+      })
+
+      this.sendJson(res, 200, this.success(requestId, {
+        total,
+        offset,
+        limit,
+        hasMore,
+        sort,
+        filters: {
+          q,
+          type: typeFilter ? Array.from(typeFilter) : null,
+          includeAvatar
+        },
+        contacts: finalContacts
       }))
       return
     }
