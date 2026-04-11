@@ -1,12 +1,15 @@
-import { app, BrowserWindow, ipcMain, nativeTheme, protocol, net, Tray, Menu } from 'electron'
+import { app, BrowserWindow, ipcMain, nativeImage, nativeTheme, protocol, net, Tray, Menu } from 'electron'
 import { join } from 'path'
+import { randomBytes } from 'crypto'
 import { readFileSync, existsSync, mkdirSync } from 'fs'
-import { autoUpdater } from 'electron-updater'
+import { autoUpdater, type ProgressInfo } from 'electron-updater'
 import { DatabaseService } from './services/database'
+import { appUpdateService } from './services/appUpdateService'
 
 import { wechatDecryptService } from './services/decryptService'
 import { ConfigService } from './services/config'
 import { wxKeyService } from './services/wxKeyService'
+import { wxKeyServiceMac } from './services/wxKeyServiceMac'
 import { dbPathService } from './services/dbPathService'
 import { wcdbService } from './services/wcdbService'
 import { dataManagementService } from './services/dataManagementService'
@@ -23,16 +26,20 @@ import { videoService } from './services/videoService'
 
 import { voiceTranscribeService } from './services/voiceTranscribeService'
 import { voiceTranscribeServiceWhisper } from './services/voiceTranscribeServiceWhisper'
-import { windowsHelloService, WindowsHelloResult } from './services/windowsHelloService'
+import { voiceTranscribeServiceOnline } from './services/voiceTranscribeServiceOnline'
+import { systemAuthService } from './services/systemAuthService'
 import { shortcutService } from './services/shortcutService'
 import { httpApiService } from './services/httpApiService'
+import { getBestCachePath, getRuntimePlatformInfo } from './services/platformService'
+import { getMcpLaunchConfig as getMcpLaunchConfigForUi, getMcpProxyConfig } from './services/mcp/runtime'
+import { mcpProxyService } from './services/mcp/proxyService'
+import { skillInstallerService } from './services/skillInstallerService'
 
-// 扩展 app 对象类型，添加 isQuitting 标志
-declare module 'electron' {
-  interface App {
-    isQuitting?: boolean
-  }
+type AppWithQuitFlag = typeof app & {
+  isQuitting?: boolean
 }
+
+const appWithQuitFlag = app as AppWithQuitFlag
 
 // 注册自定义协议为特权协议（必须在 app ready 之前）
 protocol.registerSchemesAsPrivileged([
@@ -58,30 +65,7 @@ protocol.registerSchemesAsPrivileged([
 // 配置自动更新
 autoUpdater.autoDownload = false
 autoUpdater.autoInstallOnAppQuit = true
-autoUpdater.disableDifferentialDownload = true  // 禁用差分更新，强制全量下载
-
-/**
- * 比较两个语义化版本号
- * @param version1 版本1
- * @param version2 版本2
- * @returns version1 > version2 返回 true
- */
-function isNewerVersion(version1: string, version2: string): boolean {
-  const v1Parts = version1.split('.').map(Number)
-  const v2Parts = version2.split('.').map(Number)
-
-  // 补齐版本号位数
-  const maxLength = Math.max(v1Parts.length, v2Parts.length)
-  while (v1Parts.length < maxLength) v1Parts.push(0)
-  while (v2Parts.length < maxLength) v2Parts.push(0)
-
-  for (let i = 0; i < maxLength; i++) {
-    if (v1Parts[i] > v2Parts[i]) return true
-    if (v1Parts[i] < v2Parts[i]) return false
-  }
-
-  return false // 版本相同
-}
+autoUpdater.disableDifferentialDownload = true  // 禁用差分更新，统一使用全量安装包
 
 // 单例服务
 let dbService: DatabaseService | null = null
@@ -91,6 +75,7 @@ let logService: LogService | null = null
 
 // 系统托盘实例
 let tray: Tray | null = null
+let isInstallingUpdate = false
 
 // 聊天窗口实例
 let chatWindow: BrowserWindow | null = null
@@ -110,6 +95,65 @@ let aiSummaryWindow: BrowserWindow | null = null
 let welcomeWindow: BrowserWindow | null = null
 // 聊天记录窗口实例
 let chatHistoryWindow: BrowserWindow | null = null
+const allowDevTools = !!process.env.VITE_DEV_SERVER_URL
+
+type ReleaseAnnouncementPayload = {
+  version: string
+  releaseBody?: string
+  releaseNotes?: string
+  generatedAt?: string
+}
+
+function getReleaseAnnouncementPath(): string {
+  const isDev = !!process.env.VITE_DEV_SERVER_URL
+  return isDev
+    ? join(__dirname, '../.tmp/release-announcement.json')
+    : join(process.resourcesPath, 'release-announcement.json')
+}
+
+function syncPackagedReleaseAnnouncement() {
+  if (!configService) return
+
+  const announcementPath = getReleaseAnnouncementPath()
+  if (!existsSync(announcementPath)) {
+    return
+  }
+
+  try {
+    const raw = readFileSync(announcementPath, 'utf8')
+    const payload = JSON.parse(raw) as ReleaseAnnouncementPayload
+    if (!payload || typeof payload !== 'object') return
+
+    const version = String(payload.version || '').trim()
+    if (!version || version !== app.getVersion()) return
+
+    const releaseBody = String(payload.releaseBody || '').trim()
+    const releaseNotes = String(payload.releaseNotes || '').trim()
+
+    const storedVersion = configService.get('releaseAnnouncementVersion')
+    const storedBody = configService.get('releaseAnnouncementBody')
+    const storedNotes = configService.get('releaseAnnouncementNotes')
+
+    if (
+      storedVersion === version &&
+      storedBody === releaseBody &&
+      storedNotes === releaseNotes
+    ) {
+      return
+    }
+
+    configService.set('releaseAnnouncementVersion', version)
+    configService.set('releaseAnnouncementBody', releaseBody)
+    configService.set('releaseAnnouncementNotes', releaseNotes)
+    logService?.info('ReleaseAnnouncement', '已同步本地版本公告', {
+      version,
+      hasBody: Boolean(releaseBody),
+      hasNotes: Boolean(releaseNotes)
+    })
+  } catch (error) {
+    logService?.warn('ReleaseAnnouncement', '同步本地版本公告失败', { error: String(error) })
+  }
+}
 
 /**
  * 获取当前主题的 URL 查询参数
@@ -129,6 +173,18 @@ function getAppIconPath(): string {
   const isDev = !!process.env.VITE_DEV_SERVER_URL
   const iconName = configService?.get('appIcon') || 'default'
 
+  if (process.platform === 'darwin') {
+    if (iconName === 'xinnian') {
+      return isDev
+        ? join(__dirname, '../public/xinnian.icns')
+        : join(process.resourcesPath, 'icon.icns')
+    }
+
+    return isDev
+      ? join(__dirname, '../public/icon.icns')
+      : join(process.resourcesPath, 'icon.icns')
+  }
+
   if (iconName === 'xinnian') {
     return isDev
       ? join(__dirname, '../public/xinnian.ico')
@@ -140,14 +196,67 @@ function getAppIconPath(): string {
   }
 }
 
+function getDockIconPath(): string {
+  const isDev = !!process.env.VITE_DEV_SERVER_URL
+  const iconName = configService?.get('appIcon') || 'default'
+
+  if (iconName === 'xinnian') {
+    const devPaddedPath = join(__dirname, '../public/xinnian-dock.png')
+    const devFallbackPath = join(__dirname, '../public/xinnian.png')
+    return isDev
+      ? (existsSync(devPaddedPath) ? devPaddedPath : devFallbackPath)
+      : join(process.resourcesPath, 'icon.png')
+  }
+
+  const devPaddedPath = join(__dirname, '../public/icon-dock.png')
+  const devFallbackPath = join(__dirname, '../public/logo.png')
+  return isDev
+    ? (existsSync(devPaddedPath) ? devPaddedPath : devFallbackPath)
+    : join(process.resourcesPath, 'icon.png')
+}
+
+function getTrayIconPath(): string {
+  if (process.platform === 'darwin') {
+    const isDev = !!process.env.VITE_DEV_SERVER_URL
+    const iconName = configService?.get('appIcon') || 'default'
+    const devTrayPath = iconName === 'xinnian'
+      ? join(__dirname, '../public/xinnian-tray.png')
+      : join(__dirname, '../public/tray-mac.png')
+
+    if (isDev && existsSync(devTrayPath)) {
+      return devTrayPath
+    }
+  }
+
+  return getAppIconPath()
+}
+
+function getTrayImage() {
+  const iconPath = getTrayIconPath()
+  const image = nativeImage.createFromPath(iconPath)
+
+  if (image.isEmpty()) {
+    return iconPath
+  }
+
+  if (process.platform === 'darwin') {
+    return image.resize({ height: 26 })
+  }
+
+  return image
+}
+
 /**
  * 创建系统托盘
  */
 function createTray() {
   if (tray) return tray
 
-  const iconPath = getAppIconPath()
-  tray = new Tray(iconPath)
+  tray = new Tray(getTrayImage())
+
+  if (process.platform === 'darwin') {
+    tray.setIgnoreDoubleClickEvents(true)
+  }
 
   const contextMenu = Menu.buildFromTemplate([
     {
@@ -167,7 +276,7 @@ function createTray() {
       label: '退出',
       click: () => {
         // 设置标志，允许真正退出
-        app.isQuitting = true
+        appWithQuitFlag.isQuitting = true
         app.quit()
       }
     }
@@ -201,6 +310,7 @@ function createWindow() {
     icon: iconPath,
     webPreferences: {
       preload: join(__dirname, 'preload.js'),
+      devTools: allowDevTools,
       contextIsolation: true,
       nodeIntegration: false,
       webSecurity: false  // 允许加载本地文件
@@ -219,6 +329,26 @@ function createWindow() {
   dbService = new DatabaseService()
 
   logService = new LogService(configService)
+  syncPackagedReleaseAnnouncement()
+  mcpProxyService.setLogger(logService)
+  autoUpdater.logger = {
+    info(message: string) {
+      logService?.info('AppUpdate', message)
+      appUpdateService.noteUpdaterMessage(String(message), 'info')
+    },
+    warn(message: string) {
+      logService?.warn('AppUpdate', message)
+      appUpdateService.noteUpdaterMessage(String(message), 'warn')
+    },
+    error(message: string) {
+      logService?.error('AppUpdate', message)
+      appUpdateService.noteUpdaterMessage(String(message), 'error')
+    },
+    debug(message: string) {
+      logService?.debug('AppUpdate', message)
+      appUpdateService.noteUpdaterMessage(String(message), 'info')
+    }
+  }
 
   // 记录应用启动日志
   logService.info('App', '应用启动', { version: app.getVersion() })
@@ -236,8 +366,19 @@ function createWindow() {
 
   // 监听窗口关闭事件
   win.on('close', (event) => {
+    const updateInfo = appUpdateService.getCachedUpdateInfo()
+    if (updateInfo?.forceUpdate) {
+      appWithQuitFlag.isQuitting = true
+      return
+    }
+
+    if (isInstallingUpdate) {
+      appWithQuitFlag.isQuitting = true
+      return
+    }
+
     // 如果是真正退出应用，不阻止
-    if (app.isQuitting) {
+    if (appWithQuitFlag.isQuitting) {
       return
     }
 
@@ -260,7 +401,7 @@ function createWindow() {
     // 配置为直接退出时，需要显式退出应用。
     // 否则主窗口关闭后托盘仍然存在，进程不会真正结束。
     event.preventDefault()
-    app.isQuitting = true
+    appWithQuitFlag.isQuitting = true
     app.quit()
   })
 
@@ -312,6 +453,7 @@ function createChatWindow() {
     icon: iconPath,
     webPreferences: {
       preload: join(__dirname, 'preload.js'),
+      devTools: allowDevTools,
       contextIsolation: true,
       nodeIntegration: false,
       webSecurity: false  // 允许加载本地文件
@@ -320,7 +462,7 @@ function createChatWindow() {
     titleBarOverlay: {
       color: '#00000000',
       symbolColor: '#666666',
-      height: 32
+      height: 40
     },
     show: false,
     backgroundColor: isDark ? '#1A1A1A' : '#F0F0F0'
@@ -386,6 +528,7 @@ function createGroupAnalyticsWindow() {
     icon: iconPath,
     webPreferences: {
       preload: join(__dirname, 'preload.js'),
+      devTools: allowDevTools,
       contextIsolation: true,
       nodeIntegration: false,
       webSecurity: false  // 允许加载本地文件
@@ -394,7 +537,7 @@ function createGroupAnalyticsWindow() {
     titleBarOverlay: {
       color: '#00000000',
       symbolColor: '#666666',
-      height: 32
+      height: 40
     },
     show: false,
     backgroundColor: isDark ? '#1A1A1A' : '#F0F0F0'
@@ -463,6 +606,7 @@ function createMomentsWindow(filterUsername?: string) {
     icon: iconPath,
     webPreferences: {
       preload: join(__dirname, 'preload.js'),
+      devTools: allowDevTools,
       contextIsolation: true,
       nodeIntegration: false,
       webSecurity: false  // 允许加载本地文件
@@ -471,7 +615,7 @@ function createMomentsWindow(filterUsername?: string) {
     titleBarOverlay: {
       color: '#00000000',
       symbolColor: '#666666',
-      height: 32
+      height: 40
     },
     show: false,
     backgroundColor: isDark ? '#1A1A1A' : '#F0F0F0'
@@ -551,6 +695,7 @@ function createChatHistoryWindow(sessionId: string, messageId: number) {
     icon: iconPath,
     webPreferences: {
       preload: join(__dirname, 'preload.js'),
+      devTools: allowDevTools,
       contextIsolation: true,
       nodeIntegration: false,
       webSecurity: false  // 允许加载本地文件
@@ -559,7 +704,7 @@ function createChatHistoryWindow(sessionId: string, messageId: number) {
     titleBarOverlay: {
       color: '#00000000',
       symbolColor: isDark ? '#ffffff' : '#1a1a1a',
-      height: 32
+      height: 40
     },
     show: false,
     backgroundColor: isDark ? '#1A1A1A' : '#F0F0F0',
@@ -616,6 +761,7 @@ function createAnnualReportWindow(year: number) {
     icon: iconPath,
     webPreferences: {
       preload: join(__dirname, 'preload.js'),
+      devTools: allowDevTools,
       contextIsolation: true,
       nodeIntegration: false,
       webSecurity: false  // 允许加载本地文件
@@ -624,7 +770,7 @@ function createAnnualReportWindow(year: number) {
     titleBarOverlay: {
       color: '#00000000',
       symbolColor: isDark ? '#FFFFFF' : '#333333',
-      height: 32
+      height: 40
     },
     show: false,
     backgroundColor: isDark ? '#1A1A1A' : '#F9F8F6'
@@ -687,6 +833,7 @@ function createAgreementWindow() {
     icon: iconPath,
     webPreferences: {
       preload: join(__dirname, 'preload.js'),
+      devTools: allowDevTools,
       contextIsolation: true,
       nodeIntegration: false,
       webSecurity: false  // 允许加载本地文件
@@ -695,7 +842,7 @@ function createAgreementWindow() {
     titleBarOverlay: {
       color: '#00000000',
       symbolColor: isDark ? '#FFFFFF' : '#333333',
-      height: 32
+      height: 40
     },
     show: false,
     backgroundColor: isDark ? '#1A1A1A' : '#FFFFFF'
@@ -727,7 +874,7 @@ function createAgreementWindow() {
 /**
  * 创建首次引导窗口（独立无边框透明窗口）
  */
-function createWelcomeWindow() {
+function createWelcomeWindow(mode: 'default' | 'add-account' = 'default') {
   // 如果已存在，聚焦
   if (welcomeWindow && !welcomeWindow.isDestroyed()) {
     welcomeWindow.focus()
@@ -748,6 +895,7 @@ function createWelcomeWindow() {
     icon: iconPath,
     webPreferences: {
       preload: join(__dirname, 'preload.js'),
+      devTools: allowDevTools,
       contextIsolation: true,
       nodeIntegration: false,
       webSecurity: false  // 允许加载本地文件
@@ -759,10 +907,12 @@ function createWelcomeWindow() {
     welcomeWindow?.show()
   })
 
+  const welcomeHash = mode === 'add-account' ? '/welcome-window?mode=add-account' : '/welcome-window'
+
   if (process.env.VITE_DEV_SERVER_URL) {
-    welcomeWindow.loadURL(`${process.env.VITE_DEV_SERVER_URL}#/welcome-window`)
+    welcomeWindow.loadURL(`${process.env.VITE_DEV_SERVER_URL}#${welcomeHash}`)
   } else {
-    welcomeWindow.loadFile(join(__dirname, '../dist/index.html'), { hash: '/welcome-window' })
+    welcomeWindow.loadFile(join(__dirname, '../dist/index.html'), { hash: welcomeHash })
   }
 
   welcomeWindow.on('closed', () => {
@@ -791,6 +941,7 @@ function createPurchaseWindow() {
     minHeight: 600,
     icon: iconPath,
     webPreferences: {
+      devTools: allowDevTools,
       contextIsolation: true,
       nodeIntegration: false,
       webSecurity: false  // 允许加载本地文件
@@ -823,10 +974,7 @@ function createImageViewerWindow(
   liveVideoPath?: string,
   options?: { sessionId?: string; imageMd5?: string; imageDatName?: string }
 ) {
-  const isDev = !!process.env.VITE_DEV_SERVER_URL
-  const iconPath = isDev
-    ? join(__dirname, '../public/icon.ico')
-    : join(process.resourcesPath, 'icon.ico')
+  const iconPath = getAppIconPath()
 
   const win = new BrowserWindow({
     width: 800,
@@ -836,6 +984,7 @@ function createImageViewerWindow(
     icon: iconPath,
     webPreferences: {
       preload: join(__dirname, 'preload.js'),
+      devTools: allowDevTools,
       contextIsolation: true,
       nodeIntegration: false,
       webSecurity: false // 允许加载本地文件
@@ -844,7 +993,7 @@ function createImageViewerWindow(
     titleBarOverlay: {
       color: '#00000000',
       symbolColor: '#ffffff',
-      height: 32
+      height: 40
     },
     show: false,
     backgroundColor: '#000000',
@@ -890,10 +1039,7 @@ function createImageViewerWindow(
  * 窗口大小会根据视频比例自动调整
  */
 function createVideoPlayerWindow(videoPath: string, videoWidth?: number, videoHeight?: number) {
-  const isDev = !!process.env.VITE_DEV_SERVER_URL
-  const iconPath = isDev
-    ? join(__dirname, '../public/icon.ico')
-    : join(process.resourcesPath, 'icon.ico')
+  const iconPath = getAppIconPath()
 
   // 获取屏幕尺寸
   const { screen } = require('electron')
@@ -944,6 +1090,7 @@ function createVideoPlayerWindow(videoPath: string, videoWidth?: number, videoHe
     icon: iconPath,
     webPreferences: {
       preload: join(__dirname, 'preload.js'),
+      devTools: allowDevTools,
       contextIsolation: true,
       nodeIntegration: false,
       webSecurity: false
@@ -993,10 +1140,7 @@ function createVideoPlayerWindow(videoPath: string, videoWidth?: number, videoHe
  * 创建内置浏览器窗口
  */
 function createBrowserWindow(url: string, title?: string) {
-  const isDev = !!process.env.VITE_DEV_SERVER_URL
-  const iconPath = isDev
-    ? join(__dirname, '../public/icon.ico')
-    : join(process.resourcesPath, 'icon.ico')
+  const iconPath = getAppIconPath()
 
   const win = new BrowserWindow({
     width: 1200,
@@ -1006,6 +1150,7 @@ function createBrowserWindow(url: string, title?: string) {
     icon: iconPath,
     webPreferences: {
       preload: join(__dirname, 'preload.js'),
+      devTools: allowDevTools,
       contextIsolation: true,
       nodeIntegration: false,
       webSecurity: false,
@@ -1065,10 +1210,7 @@ function createAISummaryWindow(sessionId: string, sessionName: string) {
     aiSummaryWindow = null
   }
 
-  const isDev = !!process.env.VITE_DEV_SERVER_URL
-  const iconPath = isDev
-    ? join(__dirname, '../public/icon.ico')
-    : join(process.resourcesPath, 'icon.ico')
+  const iconPath = getAppIconPath()
 
   const isDark = nativeTheme.shouldUseDarkColors
 
@@ -1080,6 +1222,7 @@ function createAISummaryWindow(sessionId: string, sessionName: string) {
     icon: iconPath,
     webPreferences: {
       preload: join(__dirname, 'preload.js'),
+      devTools: allowDevTools,
       contextIsolation: true,
       nodeIntegration: false,
       webSecurity: false  // 允许加载本地文件
@@ -1152,6 +1295,52 @@ function registerIpcHandlers() {
 
   ipcMain.handle('config:setTldCache', async (_, tlds: string[]) => {
     return configService?.setTldCache(tlds)
+  })
+
+  ipcMain.handle('accounts:list', async () => {
+    return configService?.listAccounts() || []
+  })
+
+  ipcMain.handle('accounts:getActive', async () => {
+    return configService?.getActiveAccount() || null
+  })
+
+  ipcMain.handle('accounts:setActive', async (_, accountId: string) => {
+    return configService?.setActiveAccount(accountId) || null
+  })
+
+  ipcMain.handle('accounts:save', async (_, profile: any) => {
+    return configService?.saveAccount(profile) || null
+  })
+
+  ipcMain.handle('accounts:update', async (_, accountId: string, patch: any) => {
+    return configService?.updateAccount(accountId, patch) || null
+  })
+
+  ipcMain.handle('accounts:delete', async (_, accountId: string, deleteLocalData = false) => {
+    if (!configService) {
+      return { success: false, error: '配置服务未初始化' }
+    }
+
+    const deleted = configService.listAccounts().find((item) => item.id === accountId) || null
+    if (!deleted) {
+      return { success: false, error: '账号不存在' }
+    }
+
+    if (deleteLocalData) {
+      const cacheService = new (await import('./services/cacheService')).CacheService(configService)
+      const clearResult = await cacheService.clearAccountDatabases(deleted)
+      if (!clearResult.success) {
+        return { success: false, error: clearResult.error || '删除账号本地数据失败' }
+      }
+    }
+
+    const result = configService.deleteAccount(accountId)
+    return { success: true, deleted: result.deleted, nextActiveAccountId: result.nextActiveAccountId }
+  })
+
+  ipcMain.handle('skillInstaller:exportSkillZip', async (_, skillName: string) => {
+    return skillInstallerService.exportSkillZip(skillName)
   })
 
   // HTTP API 管理
@@ -1262,6 +1451,16 @@ function registerIpcHandlers() {
     }
   })
 
+  ipcMain.handle('file:writeBase64', async (_, filePath: string, base64Data: string) => {
+    try {
+      const fs = await import('fs')
+      fs.writeFileSync(filePath, Buffer.from(base64Data, 'base64'))
+      return { success: true }
+    } catch (error: any) {
+      return { success: false, error: error.message }
+    }
+  })
+
   ipcMain.handle('shell:openPath', async (_, path: string) => {
     const { shell } = await import('electron')
     return shell.openPath(path)
@@ -1285,44 +1484,63 @@ function registerIpcHandlers() {
     return app.getVersion()
   })
 
-  ipcMain.handle('app:checkForUpdates', async () => {
-    try {
-      const result = await autoUpdater.checkForUpdates()
-      if (result && result.updateInfo) {
-        const currentVersion = app.getVersion()
-        const latestVersion = result.updateInfo.version
+  ipcMain.handle('app:getPlatformInfo', async () => {
+    return getRuntimePlatformInfo()
+  })
 
-        // 使用语义化版本比较
-        if (isNewerVersion(latestVersion, currentVersion)) {
-          return {
-            hasUpdate: true,
-            version: latestVersion,
-            releaseNotes: result.updateInfo.releaseNotes as string || ''
-          }
-        }
-      }
-      return { hasUpdate: false }
-    } catch (error) {
-      console.error('检查更新失败:', error)
-      return { hasUpdate: false }
+  ipcMain.handle('app:getMcpLaunchConfig', async () => {
+    return getMcpLaunchConfigForUi()
+  })
+
+  ipcMain.on('app:getMcpLaunchConfig:request', (event, payload: { requestId?: string } | undefined) => {
+    const requestId = payload?.requestId
+    if (!requestId) return
+    event.sender.send(`app:getMcpLaunchConfig:response:${requestId}`, getMcpLaunchConfigForUi())
+  })
+
+  ipcMain.handle('app:checkForUpdates', async () => {
+    return appUpdateService.checkForUpdates()
+  })
+
+  ipcMain.handle('app:getUpdateState', async () => {
+    return appUpdateService.getCachedUpdateInfo()
+  })
+
+  ipcMain.handle('app:getUpdateSourceInfo', async () => {
+    return {
+      primaryUpdateSource: 'github' as const,
+      githubRepository: appUpdateService.getGithubRepository(),
+      policySources: ['github', 'custom'] as const,
+      policyPrecedence: 'github' as const,
+      forceUpdatePolicyFallbackUrl: appUpdateService.getForceUpdatePolicyFallbackUrl()
     }
   })
 
   ipcMain.handle('app:setAppIcon', async (_, iconName: string) => {
     try {
-      const iconPath = getAppIconPath()
+      const iconPath = process.platform === 'darwin' ? getDockIconPath() : getAppIconPath()
 
       if (existsSync(iconPath)) {
-        const { nativeImage } = require('electron')
         const image = nativeImage.createFromPath(iconPath)
-        BrowserWindow.getAllWindows().forEach(win => {
-          win.setIcon(image)
-        })
+
+        if (process.platform === 'darwin') {
+          if (!image.isEmpty()) {
+            app.dock?.setIcon(image)
+          }
+        } else {
+          BrowserWindow.getAllWindows().forEach(win => {
+            win.setIcon(image)
+          })
+        }
 
         // 尝试更新桌面快捷方式图标 (不阻塞主线程)
         shortcutService.updateDesktopShortcutIcon(iconPath).catch(err => {
           console.error('更新快捷方式失败:', err)
         })
+
+        if (tray) {
+          tray.setImage(getTrayImage())
+        }
 
         return { success: true }
       }
@@ -1336,21 +1554,93 @@ function registerIpcHandlers() {
   ipcMain.handle('app:downloadAndInstall', async (event) => {
     const win = BrowserWindow.fromWebContents(event.sender)
 
-    // 监听下载进度
-    autoUpdater.on('download-progress', (progress) => {
-      win?.webContents.send('app:downloadProgress', progress.percent)
-    })
+    if (isInstallingUpdate) {
+      logService?.warn('AppUpdate', '下载更新请求被忽略，当前已有下载任务进行中', {
+        targetVersion: appUpdateService.getCachedUpdateInfo()?.version
+      })
+      return
+    }
 
-    // 下载完成后自动安装
-    autoUpdater.on('update-downloaded', () => {
-      autoUpdater.quitAndInstall(false, true)
+    isInstallingUpdate = true
+    const cachedUpdateInfo = appUpdateService.getCachedUpdateInfo()
+    const targetVersion = cachedUpdateInfo?.version
+
+    appUpdateService.updateDiagnostics({
+      phase: 'downloading',
+      targetVersion,
+      lastError: undefined,
+      progressPercent: 0,
+      downloadedBytes: 0,
+      totalBytes: undefined,
+      lastEvent: targetVersion ? `开始下载更新 ${targetVersion}` : '开始下载更新'
     })
+    logService?.info('AppUpdate', '开始下载更新', { targetVersion, differentialEnabled: !autoUpdater.disableDifferentialDownload })
+
+    const onDownloadProgress = (progress: ProgressInfo) => {
+      const payload = {
+        percent: progress.percent,
+        transferred: progress.transferred,
+        total: progress.total,
+        bytesPerSecond: progress.bytesPerSecond
+      }
+      BrowserWindow.getAllWindows().forEach(currentWindow => {
+        currentWindow.webContents.send('app:downloadProgress', payload)
+      })
+      appUpdateService.updateDiagnostics({
+        phase: 'downloading',
+        progressPercent: progress.percent,
+        downloadedBytes: progress.transferred,
+        totalBytes: progress.total,
+        lastEvent: `下载中 ${progress.percent.toFixed(1)}%`
+      })
+    }
+
+    const onUpdateDownloaded = () => {
+      appUpdateService.updateDiagnostics({
+        phase: 'downloaded',
+        progressPercent: 100,
+        lastEvent: '更新包下载完成，准备安装'
+      })
+      logService?.info('AppUpdate', '更新包下载完成，准备安装', {
+        targetVersion,
+        fallbackToFull: appUpdateService.getCachedUpdateInfo()?.diagnostics?.fallbackToFull || false
+      })
+      appWithQuitFlag.isQuitting = true
+      appUpdateService.updateDiagnostics({
+        phase: 'installing',
+        lastEvent: '开始调用安装器'
+      })
+      autoUpdater.quitAndInstall(false, true)
+    }
+
+    const onUpdaterError = (error: Error) => {
+      isInstallingUpdate = false
+      appUpdateService.updateDiagnostics({
+        phase: 'failed',
+        lastError: String(error),
+        lastEvent: '下载或安装更新失败'
+      })
+      logService?.error('AppUpdate', '下载或安装更新失败', {
+        targetVersion,
+        error: String(error),
+        fallbackToFull: appUpdateService.getCachedUpdateInfo()?.diagnostics?.fallbackToFull || false
+      })
+    }
+
+    autoUpdater.on('download-progress', onDownloadProgress)
+    autoUpdater.once('update-downloaded', onUpdateDownloaded)
+    autoUpdater.once('error', onUpdaterError)
 
     try {
       await autoUpdater.downloadUpdate()
     } catch (error) {
-      console.error('下载更新失败:', error)
+      isInstallingUpdate = false
+      onUpdaterError(error as Error)
       throw error
+    } finally {
+      autoUpdater.removeListener('download-progress', onDownloadProgress)
+      autoUpdater.removeListener('update-downloaded', onUpdateDownloaded)
+      autoUpdater.removeListener('error', onUpdaterError)
     }
   })
 
@@ -1500,38 +1790,163 @@ function registerIpcHandlers() {
     }
   })
 
-  // Windows Hello 原生验证 (比 WebAuthn 更快)
-  ipcMain.handle('windowsHello:isAvailable', async () => {
-    return windowsHelloService.isAvailable()
+  ipcMain.handle('systemAuth:getStatus', async () => {
+    return systemAuthService.getStatus()
   })
 
-  ipcMain.handle('windowsHello:verify', async (_, message?: string) => {
-    return windowsHelloService.verify(message)
+  ipcMain.handle('systemAuth:verify', async (_, reason?: string) => {
+    return systemAuthService.verify(reason)
   })
 
   // 密钥获取相关
   ipcMain.handle('wxkey:isWeChatRunning', async () => {
+    if (process.platform === 'darwin') {
+      return wxKeyServiceMac.isWeChatRunning()
+    }
     return wxKeyService.isWeChatRunning()
   })
 
   ipcMain.handle('wxkey:getWeChatPid', async () => {
+    if (process.platform === 'darwin') {
+      return wxKeyServiceMac.getWeChatPid()
+    }
     return wxKeyService.getWeChatPid()
   })
 
   ipcMain.handle('wxkey:killWeChat', async () => {
+    if (process.platform === 'darwin') {
+      return wxKeyServiceMac.killWeChat()
+    }
     return wxKeyService.killWeChat()
   })
 
-  ipcMain.handle('wxkey:launchWeChat', async () => {
-    return wxKeyService.launchWeChat()
+  ipcMain.handle('wxkey:launchWeChat', async (_, customWechatPath?: string) => {
+    if (process.platform === 'darwin') {
+      return wxKeyServiceMac.launchWeChat(customWechatPath)
+    }
+    return wxKeyService.launchWeChat(customWechatPath)
   })
 
   ipcMain.handle('wxkey:waitForWindow', async (_, maxWaitSeconds?: number) => {
+    if (process.platform === 'darwin') {
+      return wxKeyServiceMac.waitForWeChatWindow(maxWaitSeconds)
+    }
     return wxKeyService.waitForWeChatWindow(maxWaitSeconds)
   })
 
-  ipcMain.handle('wxkey:startGetKey', async (event, customWechatPath?: string) => {
+  ipcMain.handle('wxkey:startGetKey', async (event, customWechatPath?: string, dbPath?: string) => {
     logService?.info('WxKey', '开始获取微信密钥', { customWechatPath })
+    if (process.platform === 'darwin') {
+      try {
+        const isRunning = wxKeyServiceMac.isWeChatRunning()
+        if (isRunning) {
+          event.sender.send('wxkey:status', { status: '检测到微信正在运行，正在关闭微信...', level: 0 })
+          wxKeyServiceMac.killWeChat()
+
+          const exited = await wxKeyServiceMac.waitForWeChatExit(20)
+          if (!exited) {
+            return { success: false, error: '未能自动关闭微信，请先手动退出微信后重试' }
+          }
+
+          event.sender.send('wxkey:status', { status: '微信已关闭，正在重新启动微信...', level: 0 })
+          const relaunched = await wxKeyServiceMac.launchWeChat(customWechatPath)
+          if (!relaunched) {
+            return { success: false, error: '微信关闭后自动重启失败' }
+          }
+
+          event.sender.send('wxkey:status', { status: '微信已重新启动，等待主进程就绪...', level: 0 })
+          const ready = await wxKeyServiceMac.waitForWeChatWindow(20)
+          if (!ready) {
+            return { success: false, error: '微信已重新启动，但未检测到可用主进程，请确认微信已完成启动并显示主窗口' }
+          }
+        } else {
+          event.sender.send('wxkey:status', { status: '未检测到微信主进程，正在尝试启动微信...', level: 0 })
+
+          const launched = await wxKeyServiceMac.launchWeChat(customWechatPath)
+          if (!launched) {
+            return { success: false, error: '未找到微信主进程，且自动启动微信失败' }
+          }
+
+          event.sender.send('wxkey:status', { status: '微信已启动，等待主进程就绪...', level: 0 })
+          const ready = await wxKeyServiceMac.waitForWeChatWindow(20)
+          if (!ready) {
+            return { success: false, error: '微信已启动，但未检测到可用主进程，请确认微信已完成启动并显示主窗口' }
+          }
+        }
+
+        const result = await wxKeyServiceMac.autoGetDbKey(180_000, (status, level) => {
+          event.sender.send('wxkey:status', { status, level })
+        })
+
+        if (!result.success) {
+          logService?.warn('WxKey', 'macOS 数据库密钥获取失败', { error: result.error })
+          return result
+        }
+
+        if (result.key && dbPath) {
+          event.sender.send('wxkey:status', { status: '已获取候选密钥，正在验证数据库...', level: 0 })
+
+          const wxidCandidates: string[] = []
+          const pushWxid = (value?: string | null) => {
+            const wxid = String(value || '').trim()
+            if (!wxid || wxidCandidates.includes(wxid)) return
+            wxidCandidates.push(wxid)
+          }
+
+          let currentAccount = wxKeyServiceMac.detectCurrentAccount(dbPath, 10)
+          if (!currentAccount) {
+            currentAccount = wxKeyServiceMac.detectCurrentAccount(dbPath, 60)
+          }
+          pushWxid(currentAccount?.wxid)
+
+          try {
+            const scannedWxids = dbPathService.scanWxids(dbPath)
+            for (const wxid of scannedWxids) {
+              pushWxid(wxid)
+            }
+          } catch {
+            // ignore
+          }
+
+          let validatedWxid = ''
+          let lastError = ''
+          for (const wxid of wxidCandidates) {
+            event.sender.send('wxkey:status', { status: `正在验证账号目录: ${wxid}`, level: 0 })
+            const testResult = await wcdbService.testConnection(dbPath, result.key, wxid)
+            if (testResult.success) {
+              validatedWxid = wxid
+              break
+            }
+            lastError = testResult.error || ''
+          }
+
+          if (!validatedWxid) {
+            logService?.warn('WxKey', 'macOS 候选密钥未通过数据库验证', {
+              dbPath,
+              candidateCount: wxidCandidates.length
+            })
+            return {
+              success: false,
+              error: lastError || '已捕获到候选密钥，但未通过数据库验证。请在微信完成登录后进入任意聊天，让数据库访问真正触发，再重试。'
+            }
+          }
+
+          logService?.info('WxKey', 'macOS 候选密钥已通过数据库验证', { dbPath, wxid: validatedWxid })
+          return {
+            ...result,
+            validatedWxid
+          }
+        }
+
+        logService?.info('WxKey', 'macOS 数据库密钥获取成功', { keyLength: result.key?.length || 0 })
+        return result
+      } catch (e) {
+        wxKeyServiceMac.dispose()
+        logService?.error('WxKey', 'macOS 获取密钥异常', { error: String(e) })
+        return { success: false, error: String(e) }
+      }
+    }
+
     try {
       // 初始化 DLL
       const initSuccess = await wxKeyService.initialize()
@@ -1624,11 +2039,18 @@ function registerIpcHandlers() {
   })
 
   ipcMain.handle('wxkey:cancel', async () => {
+    if (process.platform === 'darwin') {
+      wxKeyServiceMac.dispose()
+      return true
+    }
     wxKeyService.dispose()
     return true
   })
 
   ipcMain.handle('wxkey:detectCurrentAccount', async (_, dbPath?: string, maxTimeDiffMinutes?: number) => {
+    if (process.platform === 'darwin') {
+      return wxKeyServiceMac.detectCurrentAccount(dbPath, maxTimeDiffMinutes)
+    }
     return wxKeyService.detectCurrentAccount(dbPath, maxTimeDiffMinutes)
   })
 
@@ -1647,26 +2069,9 @@ function registerIpcHandlers() {
 
   // 获取最佳缓存目录
   ipcMain.handle('dbpath:getBestCachePath', async () => {
-    const { existsSync } = require('fs')
-    const { join } = require('path')
-
-    // 按优先级检查磁盘：D、E、F、C
-    const drives = ['D', 'E', 'F', 'C']
-
-    for (const drive of drives) {
-      const drivePath = `${drive}:\\`
-      if (existsSync(drivePath)) {
-        const cachePath = join(drivePath, 'CipherTalkDB')
-        logService?.info('CachePath', `找到可用磁盘: ${drive}`, { cachePath })
-        return { success: true, path: cachePath, drive }
-      }
-    }
-
-    // 如果都没有，返回用户目录下的默认路径
-    const { app } = require('electron')
-    const defaultPath = join(app.getPath('userData'), 'cache')
-    logService?.warn('CachePath', '未找到常规磁盘，使用默认路径', { defaultPath })
-    return { success: true, path: defaultPath, drive: 'default' }
+    const result = getBestCachePath()
+    logService?.info('CachePath', '返回平台默认缓存目录', result)
+    return result
   })
 
   // WCDB 数据库相关
@@ -1694,6 +2099,26 @@ function registerIpcHandlers() {
       }
     }
     return result
+  })
+
+  ipcMain.handle('wcdb:resolveValidWxid', async (_, dbPath: string, hexKey: string) => {
+    try {
+      const wxids = dbPathService.scanWxids(dbPath)
+      if (wxids.length === 0) {
+        return { success: false, error: '未检测到账号目录' }
+      }
+
+      for (const wxid of wxids) {
+        const result = await wcdbService.testConnection(dbPath, hexKey, wxid)
+        if (result.success) {
+          return { success: true, wxid }
+        }
+      }
+
+      return { success: false, error: '未找到可通过当前密钥验证的账号目录' }
+    } catch (e) {
+      return { success: false, error: String(e) }
+    }
   })
 
   ipcMain.handle('wcdb:open', async (_, dbPath: string, hexKey: string, wxid: string) => {
@@ -1917,6 +2342,45 @@ function registerIpcHandlers() {
   // 图片密钥获取（通过 DLL 从缓存目录获取 code，用前端 wxid 计算密钥）
   ipcMain.handle('imageKey:getImageKeys', async (event, userDir: string) => {
     logService?.info('ImageKey', '开始获取图片密钥（DLL 本地扫描模式）', { userDir })
+    if (process.platform === 'darwin') {
+      try {
+        const kvcommResult = await wxKeyServiceMac.autoGetImageKey(
+          userDir,
+          (message) => event.sender.send('imageKey:progress', message)
+        )
+
+        if (kvcommResult.success) {
+          logService?.info('ImageKey', 'macOS kvcomm 图片密钥获取成功', {
+            xorKey: kvcommResult.xorKey,
+            aesKey: kvcommResult.aesKey
+          })
+          return kvcommResult
+        }
+
+        logService?.warn('ImageKey', 'macOS kvcomm 方案失败，切换内存扫描', { error: kvcommResult.error })
+        event.sender.send('imageKey:progress', 'kvcomm 方案失败，正在尝试内存扫描...')
+
+        const scanResult = await wxKeyServiceMac.autoGetImageKeyByMemoryScan(
+          userDir,
+          (message) => event.sender.send('imageKey:progress', message)
+        )
+
+        if (scanResult.success) {
+          logService?.info('ImageKey', 'macOS 内存扫描图片密钥获取成功', {
+            xorKey: scanResult.xorKey,
+            aesKey: scanResult.aesKey
+          })
+        } else {
+          logService?.error('ImageKey', 'macOS 图片密钥获取失败', { error: scanResult.error })
+        }
+
+        return scanResult
+      } catch (e) {
+        logService?.error('ImageKey', 'macOS 图片密钥获取异常', { error: String(e) })
+        return { success: false, error: String(e) }
+      }
+    }
+
     try {
       // ========== 方案一：DLL 本地扫描（优先） ==========
       const dllResult = await (async () => {
@@ -2076,6 +2540,27 @@ function registerIpcHandlers() {
     const result = await chatService.getMessagesBefore(sessionId, cursorSortSeq, limit, cursorCreateTime, cursorLocalId)
     if (!result.success) {
       logService?.warn('Chat', '按游标获取更早消息失败', {
+        sessionId,
+        cursorSortSeq,
+        cursorCreateTime,
+        cursorLocalId,
+        error: result.error
+      })
+    }
+    return result
+  })
+
+  ipcMain.handle('chat:getMessagesAfter', async (
+    _,
+    sessionId: string,
+    cursorSortSeq: number,
+    limit?: number,
+    cursorCreateTime?: number,
+    cursorLocalId?: number
+  ) => {
+    const result = await chatService.getMessagesAfter(sessionId, cursorSortSeq, limit, cursorCreateTime, cursorLocalId)
+    if (!result.success) {
+      logService?.warn('Chat', '按游标获取更新消息失败', {
         sessionId,
         cursorSortSeq,
         cursorCreateTime,
@@ -2485,8 +2970,8 @@ function registerIpcHandlers() {
   })
 
   // 打开引导窗口
-  ipcMain.handle('window:openWelcomeWindow', async () => {
-    createWelcomeWindow()
+  ipcMain.handle('window:openWelcomeWindow', async (_, mode?: 'default' | 'add-account') => {
+    createWelcomeWindow(mode || 'default')
     return true
   })
 
@@ -2691,6 +3176,28 @@ function registerIpcHandlers() {
     }
   })
 
+  ipcMain.handle('cache:clearCurrentAccount', async (_, deleteLocalData = false) => {
+    logService?.info('Cache', '开始清除当前账号配置', { deleteLocalData })
+    try {
+      const cacheService = new (await import('./services/cacheService')).CacheService(configService!)
+      return await cacheService.clearCurrentAccount(deleteLocalData)
+    } catch (e) {
+      logService?.error('Cache', '清除当前账号配置异常', { error: String(e) })
+      return { success: false, error: String(e) }
+    }
+  })
+
+  ipcMain.handle('cache:clearAllAccountConfigs', async () => {
+    logService?.info('Cache', '开始清空全部账号配置')
+    try {
+      const cacheService = new (await import('./services/cacheService')).CacheService(configService!)
+      return await cacheService.clearAllAccountConfigs()
+    } catch (e) {
+      logService?.error('Cache', '清空全部账号配置异常', { error: String(e) })
+      return { success: false, error: String(e) }
+    }
+  })
+
   ipcMain.handle('cache:getCacheSize', async () => {
     try {
       const cacheService = new (await import('./services/cacheService')).CacheService(configService!)
@@ -2852,6 +3359,11 @@ function registerIpcHandlers() {
           whisperModelType as any,
           'auto' // 自动识别语言
         )
+      } else if (sttMode === 'online') {
+        console.log('[Main] 使用在线 STT 模式')
+        result = await voiceTranscribeServiceOnline.transcribeWavBuffer(wavData, (text) => {
+          win?.webContents.send('stt:partialResult', text)
+        })
       } else {
         // 使用 SenseVoice CPU 模式
         console.log('[Main] 使用 SenseVoice CPU 模式')
@@ -2887,6 +3399,21 @@ function registerIpcHandlers() {
     try {
       voiceTranscribeService.saveTranscriptCache(sessionId, createTime, transcript)
       return { success: true }
+    } catch (e) {
+      return { success: false, error: String(e) }
+    }
+  })
+
+  ipcMain.handle('stt-online:test-config', async (_, overrides?: {
+    provider?: 'openai-compatible' | 'aliyun-qwen-asr' | 'custom'
+    apiKey?: string
+    baseURL?: string
+    model?: string
+    language?: string
+    timeoutMs?: number
+  }) => {
+    try {
+      return await voiceTranscribeServiceOnline.testConfig(overrides)
     } catch (e) {
       return { success: false, error: String(e) }
     }
@@ -3513,10 +4040,7 @@ let startupDbConnected = false
  * 创建启动屏窗口
  */
 function createSplashWindow(): BrowserWindow {
-  const isDev = !!process.env.VITE_DEV_SERVER_URL
-  const iconPath = isDev
-    ? join(__dirname, '../public/icon.ico')
-    : join(process.resourcesPath, 'icon.ico')
+  const iconPath = getAppIconPath()
 
   const splash = new BrowserWindow({
     width: 420,
@@ -3531,6 +4055,7 @@ function createSplashWindow(): BrowserWindow {
     show: true, // 直接显示窗口
     webPreferences: {
       preload: join(__dirname, 'preload.js'),
+      devTools: allowDevTools,
       contextIsolation: true,
       nodeIntegration: false,
       webSecurity: false  // 允许加载本地文件
@@ -3697,21 +4222,18 @@ function checkForUpdatesOnStartup() {
   // 延迟3秒检测，等待窗口完全加载
   setTimeout(async () => {
     try {
-      const result = await autoUpdater.checkForUpdates()
-      if (result && result.updateInfo) {
-        const currentVersion = app.getVersion()
-        const latestVersion = result.updateInfo.version
-
-        // 使用语义化版本比较
-        if (isNewerVersion(latestVersion, currentVersion) && mainWindow) {
-          // 通知渲染进程有新版本
-          mainWindow.webContents.send('app:updateAvailable', {
-            version: latestVersion,
-            releaseNotes: result.updateInfo.releaseNotes || ''
-          })
-        }
+      const result = await appUpdateService.checkForUpdates()
+      logService?.info('AppUpdate', '启动时检查更新完成', {
+        hasUpdate: result.hasUpdate,
+        currentVersion: result.currentVersion,
+        version: result.version,
+        diagnostics: result.diagnostics
+      })
+      if (result.hasUpdate && mainWindow) {
+        mainWindow.webContents.send('app:updateAvailable', result)
       }
     } catch (error) {
+      logService?.error('AppUpdate', '启动时检查更新失败', { error: String(error) })
       console.error('启动时检查更新失败:', error)
     }
   }, 3000)
@@ -3729,6 +4251,24 @@ app.on('certificate-error', (event, webContents, url, error, certificate, callba
 })
 
 app.whenReady().then(async () => {
+  if (!configService) {
+    configService = new ConfigService()
+  }
+
+  if (process.platform === 'darwin') {
+    const dockIconPath = getDockIconPath()
+    if (existsSync(dockIconPath)) {
+      const dockIcon = nativeImage.createFromPath(dockIconPath)
+      if (!dockIcon.isEmpty()) {
+        app.dock?.setIcon(dockIcon)
+      }
+    }
+  }
+
+  if (!configService.get('mcpProxyToken')) {
+    configService.set('mcpProxyToken', randomBytes(24).toString('hex'))
+  }
+
   // 注册自定义协议用于加载本地视频
   protocol.handle('local-video', (request) => {
     // 移除协议前缀并解码
@@ -3822,6 +4362,18 @@ app.whenReady().then(async () => {
     console.error('[HttpApi] 启动失败:', httpApiStartResult.error)
   }
 
+  const mcpProxyConfig = getMcpProxyConfig(configService)
+  mcpProxyService.applySettings({
+    host: mcpProxyConfig.host,
+    port: mcpProxyConfig.port,
+    token: mcpProxyConfig.token
+  })
+  const mcpProxyStartResult = await mcpProxyService.start()
+  if (!mcpProxyStartResult.success) {
+    console.error('[McpProxy] 启动失败:', mcpProxyStartResult.error)
+    logService?.error('McpProxy', '内部 MCP 代理启动失败', { error: mcpProxyStartResult.error })
+  }
+
   // 只有在配置完整时才创建主窗口
   // 如果配置不完整，checkAndConnectOnStartup 会创建引导窗口
   if (shouldShowSplash !== false || configService?.get('myWxid')) {
@@ -3858,10 +4410,13 @@ app.on('window-all-closed', () => {
 
 app.on('before-quit', () => {
   // 设置退出标志
-  app.isQuitting = true
+  appWithQuitFlag.isQuitting = true
   
   httpApiService.stop().catch((e) => {
     console.error('[HttpApi] 停止失败:', e)
+  })
+  mcpProxyService.stop().catch((e) => {
+    console.error('[McpProxy] 停止失败:', e)
   })
   // 关闭配置数据库连接
   configService?.close()

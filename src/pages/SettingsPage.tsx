@@ -1,8 +1,10 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { useSearchParams, useLocation } from 'react-router-dom'
 import { useAppStore } from '../stores/appStore'
 import { useThemeStore, themes } from '../stores/themeStore'
 import { useActivationStore } from '../stores/activationStore'
+import type { UpdateDownloadProgressPayload } from '../types/electron'
+import type { AccountProfile } from '../types/account'
 import { dialog } from '../services/ipc'
 import * as configService from '../services/config'
 import AISummarySettings from '../components/ai/AISummarySettings'
@@ -10,7 +12,7 @@ import {
   Eye, EyeOff, Key, FolderSearch, FolderOpen, Search,
   RotateCcw, Trash2, Save, Plug, X, Check, Sun, Moon, Monitor,
   Palette, Database, ImageIcon, Download, HardDrive, Info, RefreshCw, Shield, Clock, CheckCircle, AlertCircle, Mic,
-  Zap, Layers, User, Sparkles, Github, Fingerprint, Lock, ShieldCheck, Minus, Plus, Smile
+  Zap, Layers, User, Sparkles, Github, Fingerprint, Lock, ShieldCheck, Minus, Plus, Smile, ChevronDown
 } from 'lucide-react'
 import { useAuthStore } from '../stores/authStore'
 import './SettingsPage.scss'
@@ -41,16 +43,49 @@ const sttModelTypeOptions = [
   { value: 'float32', label: 'float32 完整版', size: '920 MB', desc: '更高精度，体积较大' }
 ]
 
+const sttOnlineLanguageOptions = [
+  { value: 'auto', label: '自动识别' },
+  { value: 'zh', label: '中文' },
+  { value: 'en', label: '英语' },
+  { value: 'ja', label: '日语' },
+  { value: 'ko', label: '韩语' },
+  { value: 'yue', label: '粤语' }
+]
+
+const sttOnlineProviderOptions = [
+  { value: 'openai-compatible', label: 'OpenAI 兼容' },
+  { value: 'aliyun-qwen-asr', label: '阿里云 Qwen-ASR' },
+  { value: 'custom', label: '自定义接口' }
+] as const
+
+const STT_ONLINE_DEFAULTS = {
+  'openai-compatible': {
+    baseURL: 'https://api.openai.com/v1',
+    model: 'gpt-4o-mini-transcribe'
+  },
+  'aliyun-qwen-asr': {
+    baseURL: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+    model: 'qwen3-asr-flash'
+  },
+  custom: {
+    baseURL: '',
+    model: ''
+  }
+} as const
+
 function SettingsPage() {
   const [searchParams] = useSearchParams()
   const location = useLocation()
-  const { setDbConnected, setLoading } = useAppStore()
+  const { setDbConnected, setLoading, setMyWxid: setCurrentWxid, userInfo } = useAppStore()
   const { currentTheme, themeMode, setTheme, setThemeMode, appIcon, setAppIcon } = useThemeStore()
   const { status: activationStatus, checkStatus: checkActivationStatus } = useActivationStore()
 
   const { isAuthEnabled, enableAuth, disableAuth, setupPassword, authMethod } = useAuthStore()
   const [passwordInput, setPasswordInput] = useState('')
   const [showPasswordInput, setShowPasswordInput] = useState(false)
+  const [accountsList, setAccountsList] = useState<AccountProfile[]>([])
+  const [activeAccountId, setActiveAccountId] = useState('')
+  const [editingAccountId, setEditingAccountId] = useState('')
 
   // 安全设置确认弹窗状态
   const [securityConfirm, setSecurityConfirm] = useState<{
@@ -97,8 +132,44 @@ function SettingsPage() {
   const [isCheckingUpdate, setIsCheckingUpdate] = useState(false)
   const [isDownloading, setIsDownloading] = useState(false)
   const [downloadProgress, setDownloadProgress] = useState(0)
+  const [downloadProgressDetail, setDownloadProgressDetail] = useState<UpdateDownloadProgressPayload | null>(null)
   const [appVersion, setAppVersion] = useState('')
-  const [updateInfo, setUpdateInfo] = useState<{ hasUpdate: boolean; version?: string; releaseNotes?: string } | null>(null)
+  const [updateInfo, setUpdateInfo] = useState<{
+    hasUpdate: boolean
+    forceUpdate: boolean
+    currentVersion: string
+    version?: string
+    releaseNotes?: string
+    title?: string
+    message?: string
+    minimumSupportedVersion?: string
+    reason?: 'minimum-version' | 'blocked-version'
+    checkedAt: number
+    updateSource: 'github' | 'custom' | 'none'
+    policySource: 'github' | 'custom' | 'none'
+    diagnostics?: {
+      phase: 'idle' | 'checking' | 'available' | 'downloading' | 'downloaded' | 'installing' | 'failed'
+      strategy: 'unknown' | 'differential' | 'full'
+      fallbackToFull: boolean
+      lastError?: string
+      lastEvent?: string
+      progressPercent?: number
+      downloadedBytes?: number
+      totalBytes?: number
+      targetVersion?: string
+      lastUpdatedAt: number
+    }
+  } | null>(null)
+  const [updateSourceInfo, setUpdateSourceInfo] = useState<{
+    primaryUpdateSource: 'github'
+    githubRepository: {
+      owner: string
+      repo: string
+    }
+    policySources: Array<'github' | 'custom'>
+    policyPrecedence: 'github'
+    forceUpdatePolicyFallbackUrl: string
+  } | null>(null)
   const [keyStatus, setKeyStatus] = useState('')
   const [message, setMessage] = useState<{ text: string; success: boolean } | null>(null)
   const [showDecryptKey, setShowDecryptKey] = useState(false)
@@ -106,7 +177,7 @@ function SettingsPage() {
   const [closeToTray, setCloseToTray] = useState(true)
   const [showAesKey, setShowAesKey] = useState(false)
   const [showClearDialog, setShowClearDialog] = useState<{
-    type: 'images' | 'emojis' | 'databases' | 'all' | 'config'
+    type: 'images' | 'emojis' | 'databases' | 'all' | 'currentAccount' | 'allAccounts'
     title: string
     message: string
   } | null>(null)
@@ -120,6 +191,15 @@ function SettingsPage() {
   const [isLoadingCacheSize, setIsLoadingCacheSize] = useState(false)
   const [sttLanguages, setSttLanguagesState] = useState<string[]>([])
   const [sttModelType, setSttModelType] = useState<'int8' | 'float32'>('int8')
+  const [sttMode, setSttMode] = useState<'cpu' | 'gpu' | 'online'>('cpu')
+  const [sttOnlineProvider, setSttOnlineProvider] = useState<'openai-compatible' | 'aliyun-qwen-asr' | 'custom'>('openai-compatible')
+  const [sttOnlineApiKey, setSttOnlineApiKey] = useState('')
+  const [sttOnlineBaseURL, setSttOnlineBaseURL] = useState('https://api.openai.com/v1')
+  const [sttOnlineModel, setSttOnlineModel] = useState('gpt-4o-mini-transcribe')
+  const [sttOnlineLanguage, setSttOnlineLanguage] = useState('auto')
+  const [sttOnlineTimeoutMs, setSttOnlineTimeoutMs] = useState(60000)
+  const [sttOnlineMaxConcurrency, setSttOnlineMaxConcurrency] = useState(2)
+  const [showSttOnlineLanguageDropdown, setShowSttOnlineLanguageDropdown] = useState(false)
   const [quoteStyle, setQuoteStyle] = useState<'default' | 'wechat'>('default')
   const [skipIntegrityCheck, setSkipIntegrityCheck] = useState(false)
   const [exportDefaultDateRange, setExportDefaultDateRange] = useState<number>(0)
@@ -140,8 +220,6 @@ function SettingsPage() {
   const [aiCustomSystemPrompt, setAiCustomSystemPromptState] = useState<string>('')
   const [aiEnableThinking, setAiEnableThinkingState] = useState<boolean>(true)
   const [aiMessageLimit, setAiMessageLimitState] = useState<number>(3000)
-  const [mcpEnabled, setMcpEnabledState] = useState<boolean>(false)
-  const [mcpExposeMediaPaths, setMcpExposeMediaPathsState] = useState<boolean>(true)
 
   // 日志相关状态
   const [logFiles, setLogFiles] = useState<Array<{ name: string; size: number; mtime: Date }>>([])
@@ -151,10 +229,109 @@ function SettingsPage() {
   const [isLoadingLogContent, setIsLoadingLogContent] = useState(false)
   const [logSize, setLogSize] = useState<number>(0)
   const [currentLogLevel, setCurrentLogLevel] = useState<string>('WARN')
+  const [platformInfo, setPlatformInfo] = useState<{ platform: string; arch: string }>({
+    platform: 'win32',
+    arch: 'x64'
+  })
 
   // 配置变化状态
   const [hasUnsavedChanges, setHasUnsavedChanges] = useState(false)
   const [initialConfig, setInitialConfig] = useState<any>(null)
+  const sttOnlineLanguageRef = useRef<HTMLDivElement>(null)
+  const isMac = platformInfo.platform === 'darwin'
+  const biometricLabel = isMac ? 'Touch ID' : 'Windows Hello'
+
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      if (!sttOnlineLanguageRef.current?.contains(event.target as Node)) {
+        setShowSttOnlineLanguageDropdown(false)
+      }
+    }
+
+    if (showSttOnlineLanguageDropdown) {
+      document.addEventListener('mousedown', handleClickOutside)
+    }
+
+    return () => {
+      document.removeEventListener('mousedown', handleClickOutside)
+    }
+  }, [showSttOnlineLanguageDropdown])
+
+  const getAccountDisplayName = (account?: AccountProfile | null) => {
+    if (!account) return '未命名账号'
+
+    const activeNickname = account.id === activeAccountId ? userInfo?.nickName?.trim() : ''
+    if (activeNickname) return activeNickname
+
+    const savedName = account.displayName?.trim()
+    if (savedName && savedName !== '未命名账号') return savedName
+
+    return account.wxid?.trim() || '未命名账号'
+  }
+
+  const buildAccountPayload = () => {
+    const currentAccount = accountsList.find(item => item.id === editingAccountId)
+    const currentDisplayName = currentAccount?.displayName?.trim()
+    const preferredDisplayName = userInfo?.nickName?.trim()
+      || (currentDisplayName && currentDisplayName !== '未命名账号' ? currentDisplayName : '')
+      || wxid.trim()
+      || '未命名账号'
+
+    return {
+      wxid: wxid.trim(),
+      dbPath: dbPath.trim(),
+      decryptKey: decryptKey.trim(),
+      cachePath: cachePath.trim(),
+      imageXorKey: imageXorKey.trim(),
+      imageAesKey: imageAesKey.trim(),
+      displayName: preferredDisplayName
+    }
+  }
+
+  const applyAccountToForm = (account: AccountProfile | null) => {
+    setEditingAccountId(account?.id || '')
+    setDecryptKey(account?.decryptKey || '')
+    setDbPath(account?.dbPath || '')
+    setWxid(account?.wxid || '')
+    setCachePath(account?.cachePath || '')
+    setImageXorKey(account?.imageXorKey || '')
+    setImageAesKey(account?.imageAesKey || '')
+    setIsAccountVerified(Boolean(account?.decryptKey && account?.dbPath && account?.wxid))
+  }
+
+  const refreshAccountsState = async (preferredEditingId?: string) => {
+    const [accounts, activeAccount] = await Promise.all([
+      configService.listAccounts(),
+      configService.getActiveAccount()
+    ])
+    setAccountsList(accounts)
+    setActiveAccountId(activeAccount?.id || '')
+
+    const editingId = preferredEditingId || editingAccountId || activeAccount?.id || accounts[0]?.id || ''
+    const editingAccount = accounts.find(item => item.id === editingId) || activeAccount || accounts[0] || null
+    applyAccountToForm(editingAccount)
+    return { accounts, activeAccount, editingAccount }
+  }
+
+  useEffect(() => {
+    const syncActiveAccountDisplayName = async () => {
+      const activeNickname = userInfo?.nickName?.trim()
+      if (!activeNickname || !activeAccountId) return
+
+      const activeAccount = accountsList.find(item => item.id === activeAccountId)
+      if (!activeAccount) return
+
+      const savedName = activeAccount.displayName?.trim()
+      if (savedName && savedName !== activeAccount.wxid && savedName !== '未命名账号') return
+
+      const updated = await configService.updateAccount(activeAccount.id, { displayName: activeNickname })
+      if (!updated) return
+
+      await refreshAccountsState(editingAccountId || activeAccount.id)
+    }
+
+    void syncActiveAccountDisplayName()
+  }, [userInfo?.nickName, activeAccountId, accountsList])
 
   useEffect(() => {
     loadConfig()
@@ -162,10 +339,14 @@ function SettingsPage() {
     loadAppVersion()
     loadCacheSize()
     loadLogFiles()
+    void window.electronAPI.app.getPlatformInfo().then(setPlatformInfo).catch(() => {
+      // ignore
+    })
   }, [])
 
   const loadConfig = async () => {
     try {
+      const { activeAccount, editingAccount } = await refreshAccountsState()
       const savedKey = await configService.getDecryptKey()
       const savedPath = await configService.getDbPath()
       const savedWxid = await configService.getMyWxid()
@@ -175,15 +356,24 @@ function SettingsPage() {
       const savedExportPath = await configService.getExportPath()
       const savedSttLanguages = await configService.getSttLanguages()
       const savedSttModelType = await configService.getSttModelType()
+      const savedSttMode = await configService.getSttMode()
+      const savedSttOnlineProvider = await configService.getSttOnlineProvider()
+      const savedSttOnlineApiKey = await configService.getSttOnlineApiKey()
+      const savedSttOnlineBaseURL = await configService.getSttOnlineBaseURL()
+      const savedSttOnlineModel = await configService.getSttOnlineModel()
+      const savedSttOnlineLanguage = await configService.getSttOnlineLanguage()
+      const savedSttOnlineTimeoutMs = await configService.getSttOnlineTimeoutMs()
+      const savedSttOnlineMaxConcurrency = await configService.getSttOnlineMaxConcurrency()
       const savedSkipIntegrityCheck = await configService.getSkipIntegrityCheck()
       const savedAutoUpdateDatabase = await configService.getAutoUpdateDatabase()
 
-      if (savedKey) setDecryptKey(savedKey)
-      if (savedPath) setDbPath(savedPath)
-      if (savedWxid) setWxid(savedWxid)
-      if (savedCachePath) setCachePath(savedCachePath)
-      if (savedXorKey) setImageXorKey(savedXorKey)
-      if (savedAesKey) setImageAesKey(savedAesKey)
+      if (!editingAccount && savedKey) setDecryptKey(savedKey)
+      if (!editingAccount && savedPath) setDbPath(savedPath)
+      if (!editingAccount && savedWxid) setWxid(savedWxid)
+      if (!editingAccount && savedCachePath) setCachePath(savedCachePath)
+      if (!editingAccount && savedXorKey) setImageXorKey(savedXorKey)
+      if (!editingAccount && savedAesKey) setImageAesKey(savedAesKey)
+      setIsAccountVerified(Boolean((editingAccount || activeAccount)?.decryptKey && (editingAccount || activeAccount)?.dbPath && (editingAccount || activeAccount)?.wxid))
       if (savedExportPath) setExportPath(savedExportPath)
       if (savedSttLanguages && savedSttLanguages.length > 0) {
         setSttLanguagesState(savedSttLanguages)
@@ -191,6 +381,14 @@ function SettingsPage() {
         setSttLanguagesState(['zh'])
       }
       setSttModelType(savedSttModelType)
+      setSttMode(savedSttMode)
+      setSttOnlineProvider(savedSttOnlineProvider)
+      setSttOnlineApiKey(savedSttOnlineApiKey)
+      setSttOnlineBaseURL(savedSttOnlineBaseURL)
+      setSttOnlineModel(savedSttOnlineModel)
+      setSttOnlineLanguage(savedSttOnlineLanguage)
+      setSttOnlineTimeoutMs(savedSttOnlineTimeoutMs)
+      setSttOnlineMaxConcurrency(savedSttOnlineMaxConcurrency)
       setSkipIntegrityCheck(savedSkipIntegrityCheck)
       setAutoUpdateDatabase(savedAutoUpdateDatabase)
 
@@ -221,8 +419,6 @@ function SettingsPage() {
       const savedAiCustomSystemPrompt = await configService.getAiCustomSystemPrompt()
       const savedAiEnableThinking = await configService.getAiEnableThinking()
       const savedAiMessageLimit = await configService.getAiMessageLimit()
-      const savedMcpEnabled = await configService.getMcpEnabled()
-      const savedMcpExposeMediaPaths = await configService.getMcpExposeMediaPaths()
 
       setAiProviderState(savedAiProvider)
       setAiApiKeyState(savedAiApiKey)
@@ -233,8 +429,6 @@ function SettingsPage() {
       setAiCustomSystemPromptState(savedAiCustomSystemPrompt)
       setAiEnableThinkingState(savedAiEnableThinking)
       setAiMessageLimitState(savedAiMessageLimit)
-      setMcpEnabledState(savedMcpEnabled)
-      setMcpExposeMediaPathsState(savedMcpExposeMediaPaths)
 
       // 加载关闭行为配置
       const savedCloseToTray = await configService.getCloseToTray()
@@ -251,6 +445,14 @@ function SettingsPage() {
         exportPath: savedExportPath || '',
         sttLanguages: savedSttLanguages && savedSttLanguages.length > 0 ? savedSttLanguages : ['zh'],
         sttModelType: savedSttModelType,
+        sttMode: savedSttMode,
+        sttOnlineProvider: savedSttOnlineProvider,
+        sttOnlineApiKey: savedSttOnlineApiKey,
+        sttOnlineBaseURL: savedSttOnlineBaseURL,
+        sttOnlineModel: savedSttOnlineModel,
+        sttOnlineLanguage: savedSttOnlineLanguage,
+        sttOnlineTimeoutMs: savedSttOnlineTimeoutMs,
+        sttOnlineMaxConcurrency: savedSttOnlineMaxConcurrency,
         skipIntegrityCheck: savedSkipIntegrityCheck,
         autoUpdateDatabase: savedAutoUpdateDatabase,
         autoUpdateCheckInterval: savedCheckInterval,
@@ -268,9 +470,8 @@ function SettingsPage() {
         aiCustomSystemPrompt: savedAiCustomSystemPrompt,
         aiEnableThinking: savedAiEnableThinking,
         aiMessageLimit: savedAiMessageLimit,
-        mcpEnabled: savedMcpEnabled,
-        mcpExposeMediaPaths: savedMcpExposeMediaPaths,
-        closeToTray: savedCloseToTray
+        closeToTray: savedCloseToTray,
+        editingAccountId: (editingAccount || activeAccount)?.id || ''
       })
 
     } catch (e) {
@@ -301,6 +502,14 @@ function SettingsPage() {
       exportPath,
       sttLanguages,
       sttModelType,
+      sttMode,
+      sttOnlineProvider,
+      sttOnlineApiKey,
+      sttOnlineBaseURL,
+      sttOnlineModel,
+      sttOnlineLanguage,
+      sttOnlineTimeoutMs,
+      sttOnlineMaxConcurrency,
       skipIntegrityCheck,
       autoUpdateDatabase,
       autoUpdateCheckInterval,
@@ -318,9 +527,8 @@ function SettingsPage() {
       aiCustomSystemPrompt,
       aiEnableThinking,
       aiMessageLimit,
-      mcpEnabled,
-      mcpExposeMediaPaths,
-      closeToTray
+      closeToTray,
+      editingAccountId
     }
 
     // 深度比较配置是否有变化
@@ -328,13 +536,13 @@ function SettingsPage() {
     setHasUnsavedChanges(hasChanges)
   }, [
     decryptKey, dbPath, wxid, cachePath, imageXorKey, imageAesKey, exportPath,
-    sttLanguages, sttModelType, skipIntegrityCheck, autoUpdateDatabase,
+    sttLanguages, sttModelType, sttMode, sttOnlineProvider, sttOnlineApiKey, sttOnlineBaseURL,
+    sttOnlineModel, sttOnlineLanguage, sttOnlineTimeoutMs, sttOnlineMaxConcurrency, skipIntegrityCheck, autoUpdateDatabase,
     autoUpdateCheckInterval, autoUpdateMinInterval, autoUpdateDebounceTime,
     quoteStyle, exportDefaultDateRange, exportDefaultAvatars,
     aiProvider, aiApiKey, aiModel, aiDefaultTimeRange, aiSummaryDetail,
     aiSystemPromptPreset, aiCustomSystemPrompt, aiEnableThinking, aiMessageLimit,
-    mcpEnabled, mcpExposeMediaPaths,
-    closeToTray, initialConfig
+    closeToTray, editingAccountId, initialConfig
   ])
 
   const loadAppVersion = async () => {
@@ -462,22 +670,66 @@ function SettingsPage() {
     return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`
   }
 
+  const formatSpeed = (bytesPerSecond: number): string => {
+    if (!Number.isFinite(bytesPerSecond) || bytesPerSecond <= 0) return '计算中'
+    if (bytesPerSecond < 1024) return `${bytesPerSecond.toFixed(0)} B/s`
+    if (bytesPerSecond < 1024 * 1024) return `${(bytesPerSecond / 1024).toFixed(1)} KB/s`
+    return `${(bytesPerSecond / (1024 * 1024)).toFixed(1)} MB/s`
+  }
+
+  const syncUpdateState = async () => {
+    try {
+      const state = await window.electronAPI.app.getUpdateState?.()
+      if (!state) return
+      setUpdateInfo(state)
+      const phase = state.diagnostics?.phase
+      setIsDownloading(phase === 'downloading' || phase === 'installing')
+      if (typeof state.diagnostics?.progressPercent === 'number') {
+        setDownloadProgress(state.diagnostics.progressPercent)
+      }
+    } catch (error) {
+      console.error('同步更新状态失败:', error)
+    }
+  }
+
   // 监听下载进度
   useEffect(() => {
-    const removeListener = window.electronAPI.app.onDownloadProgress?.((progress: number) => {
-      setDownloadProgress(progress)
+    syncUpdateState()
+
+    const removeListener = window.electronAPI.app.onDownloadProgress?.((progress: UpdateDownloadProgressPayload) => {
+      setDownloadProgress(progress.percent)
+      setDownloadProgressDetail(progress)
+      setIsDownloading(true)
+      setUpdateInfo((current) => {
+        if (!current) return current
+        return {
+          ...current,
+          diagnostics: {
+            phase: 'downloading',
+            strategy: current.diagnostics?.strategy || 'unknown',
+            fallbackToFull: current.diagnostics?.fallbackToFull || false,
+            lastError: current.diagnostics?.lastError,
+            lastEvent: current.diagnostics?.lastEvent,
+            progressPercent: progress.percent,
+            downloadedBytes: progress.transferred,
+            totalBytes: progress.total,
+            targetVersion: current.version || current.diagnostics?.targetVersion,
+            lastUpdatedAt: Date.now()
+          }
+        }
+      })
     })
     return () => removeListener?.()
   }, [])
 
   const handleCheckUpdate = async () => {
+    if (isDownloading || updateInfo?.diagnostics?.phase === 'installing') return
     setIsCheckingUpdate(true)
-    setUpdateInfo(null)
     try {
       const result = await window.electronAPI.app.checkForUpdates()
       if (result.hasUpdate) {
         setUpdateInfo(result)
-        showMessage(`发现新版本 ${result.version}`, true)
+        showMessage(result.forceUpdate ? `检测到强制更新 ${result.version}` : `发现新版本 ${result.version}`, true)
       } else {
         showMessage('当前已是最新版本', true)
       }
@@ -525,11 +777,19 @@ function SettingsPage() {
     })
   }
 
-  const handleClearConfig = () => {
+  const handleClearCurrentAccount = () => {
     setShowClearDialog({
-      type: 'config',
-      title: '清除配置',
-      message: '此操作将删除所有保存的配置信息（包括密钥、路径等），清除后无法恢复。确定要继续吗？'
+      type: 'currentAccount',
+      title: '清除当前账号',
+      message: '此操作将清除当前账号的密钥、路径等配置，不影响其他账号。确定要继续吗？'
+    })
+  }
+
+  const handleClearAllAccounts = () => {
+    setShowClearDialog({
+      type: 'allAccounts',
+      title: '清空全部账号配置',
+      message: '此操作将删除所有账号配置和账号级密钥/路径信息，不删除全局主题、AI、MCP、HTTP API 等通用设置。确定要继续吗？'
     })
   }
 
@@ -538,31 +798,34 @@ function SettingsPage() {
 
     try {
       let result
-      switch (showClearDialog.type) {
-        case 'images':
-          result = await window.electronAPI.cache.clearImages()
-          break
+        switch (showClearDialog.type) {
+          case 'images':
+            result = await window.electronAPI.cache.clearImages()
+            break
         case 'emojis':
           result = await window.electronAPI.cache.clearEmojis()
           break
         case 'databases':
           result = await window.electronAPI.cache.clearDatabases()
           break
-        case 'all':
-          result = await window.electronAPI.cache.clearAll()
-          break
-        case 'config':
-          result = await window.electronAPI.cache.clearConfig()
-          break
-      }
-
-      if (result.success) {
-        showMessage(`${showClearDialog.title}成功`, true)
-        if (showClearDialog.type === 'config') {
-          await loadConfig()
-        } else {
-          await loadCacheSize()
+          case 'all':
+            result = await window.electronAPI.cache.clearAll()
+            break
+          case 'currentAccount':
+            result = await window.electronAPI.cache.clearCurrentAccount(false)
+            break
+          case 'allAccounts':
+            result = await window.electronAPI.cache.clearAllAccountConfigs()
+            break
         }
+
+        if (result.success) {
+          showMessage(`${showClearDialog.title}成功`, true)
+          if (showClearDialog.type === 'currentAccount' || showClearDialog.type === 'allAccounts') {
+            await loadConfig()
+          } else {
+            await loadCacheSize()
+          }
       } else {
         showMessage(result.error || `${showClearDialog.title}失败`, false)
       }
@@ -574,23 +837,106 @@ function SettingsPage() {
   }
 
   const handleUpdateNow = async () => {
+    if (isDownloading) return
     setIsDownloading(true)
     setDownloadProgress(0)
+    setUpdateInfo((current) => current ? {
+      ...current,
+      diagnostics: {
+        phase: 'downloading',
+        strategy: current.diagnostics?.strategy || 'unknown',
+        fallbackToFull: current.diagnostics?.fallbackToFull || false,
+        lastError: undefined,
+        lastEvent: '开始下载更新',
+        progressPercent: 0,
+        downloadedBytes: 0,
+        totalBytes: current.diagnostics?.totalBytes,
+        targetVersion: current.version || current.diagnostics?.targetVersion,
+        lastUpdatedAt: Date.now()
+      }
+    } : current)
     try {
       showMessage('正在下载更新...', true)
       await window.electronAPI.app.downloadAndInstall()
     } catch (e) {
       showMessage(`更新失败: ${e}`, false)
       setIsDownloading(false)
+      await syncUpdateState()
     }
   }
 
   const handleGetKey = async () => {
     if (isGettingKey) return
     setIsGettingKey(true)
-    setKeyStatus('正在检查微信进程...')
+    setKeyStatus(isMac ? '正在准备 macOS helper...' : '正在检查微信进程...')
 
     try {
+      if (isMac) {
+        const removeListener = window.electronAPI.wxKey.onStatus(({ status }) => {
+          setKeyStatus(status)
+        })
+
+        const result = await window.electronAPI.wxKey.startGetKey(undefined, dbPath || undefined)
+        removeListener()
+
+        if (result.success && result.key) {
+          setDecryptKey(result.key)
+
+          if (dbPath) {
+            const resolved = await window.electronAPI.wcdb.resolveValidWxid(dbPath, result.key)
+            if (resolved.success && resolved.wxid) {
+              setWxid(resolved.wxid)
+              setIsAccountVerified(true)
+              showMessage(`密钥获取成功！已验证账号: ${resolved.wxid}`, true)
+              setKeyStatus('')
+              return
+            }
+          }
+
+          if (result.validatedWxid) {
+            setWxid(result.validatedWxid)
+            setIsAccountVerified(true)
+            showMessage(`密钥获取成功！已验证账号: ${result.validatedWxid}`, true)
+            setKeyStatus('')
+            return
+          }
+
+          setKeyStatus('正在检测当前登录账号...')
+
+          let accountInfo = await window.electronAPI.wxKey.detectCurrentAccount(dbPath, 10)
+          if (!accountInfo) {
+            accountInfo = await window.electronAPI.wxKey.detectCurrentAccount(dbPath, 60)
+          }
+
+          if (accountInfo) {
+            setWxid(accountInfo.wxid)
+            setIsAccountVerified(false)
+            showMessage(`密钥获取成功！已识别候选账号: ${accountInfo.wxid}，请继续验证目录。`, true)
+          } else {
+            const wxids = await window.electronAPI.dbPath.scanWxids(dbPath)
+            setWxidOptions(wxids)
+            setIsAccountVerified(false)
+
+            if (wxids.length === 1) {
+              setWxid(wxids[0])
+              showMessage('密钥获取成功，已识别到 1 个候选账号目录，请继续验证。', true)
+            } else if (wxids.length > 1) {
+              setShowWxidDropdown(true)
+              showMessage(`密钥获取成功，识别到 ${wxids.length} 个候选账号目录，请选择后验证。`, true)
+            } else {
+              showMessage('密钥获取成功，请手动填写或扫描账号目录后继续验证。', true)
+            }
+          }
+
+          setKeyStatus('')
+        } else {
+          showMessage(result.error || '获取密钥失败', false)
+          setKeyStatus('')
+        }
+
+        return
+      }
+
       const isRunning = await window.electronAPI.wxKey.isWeChatRunning()
       if (isRunning) {
         const shouldKill = window.confirm('检测到微信正在运行，需要重启微信才能获取密钥。\n是否关闭当前微信？')
@@ -627,12 +973,11 @@ function SettingsPage() {
       })
 
       setKeyStatus('Hook 已安装，请登录微信...')
-      const result = await window.electronAPI.wxKey.startGetKey()
+      const result = await window.electronAPI.wxKey.startGetKey(undefined, dbPath || undefined)
       removeListener()
 
       if (result.success && result.key) {
         setDecryptKey(result.key)
-        await configService.setDecryptKey(result.key)
 
         // 自动检测当前登录的微信账号
         setKeyStatus('正在检测当前登录账号...')
@@ -647,7 +992,6 @@ function SettingsPage() {
 
         if (accountInfo) {
           setWxid(accountInfo.wxid)
-          await configService.setMyWxid(accountInfo.wxid)
           showMessage(`密钥获取成功！已自动绑定账号: ${accountInfo.wxid}`, true)
         } else {
           showMessage('密钥获取成功，已自动保存！（未能自动检测账号，请手动输入 wxid）', true)
@@ -673,10 +1017,150 @@ function SettingsPage() {
 
   const handleOpenWelcomeWindow = async () => {
     try {
-      await window.electronAPI.window.openWelcomeWindow()
+      await window.electronAPI.window.openWelcomeWindow('add-account')
     } catch (e) {
       showMessage('打开引导窗口失败', false)
     }
+  }
+
+  const handleSelectAccountForEdit = (account: AccountProfile) => {
+    applyAccountToForm(account)
+    setInitialConfig((prev: any) => prev ? {
+      ...prev,
+      decryptKey: account.decryptKey || '',
+      dbPath: account.dbPath || '',
+      wxid: account.wxid || '',
+      cachePath: account.cachePath || '',
+      imageXorKey: account.imageXorKey || '',
+      imageAesKey: account.imageAesKey || '',
+      editingAccountId: account.id
+    } : prev)
+    setHasUnsavedChanges(false)
+  }
+
+  const handleSwitchAccountAndReconnect = async () => {
+    if (!editingAccountId || editingAccountId === activeAccountId) {
+      showMessage('当前没有待切换账号', false)
+      return
+    }
+
+    if (hasUnsavedChanges) {
+      showMessage('请先保存当前账号表单，再执行切换', false)
+      return
+    }
+
+    const target = accountsList.find((item) => item.id === editingAccountId)
+    if (!target) {
+      showMessage('待切换账号不存在', false)
+      return
+    }
+
+    if (!target.dbPath || !target.decryptKey || !target.wxid) {
+      showMessage('待切换账号配置不完整，请先保存并补全账号信息', false)
+      return
+    }
+
+    setIsLoadingState(true)
+    setLoading(true, '正在切换账号...')
+    try {
+      const switched = await configService.setActiveAccount(target.id)
+      if (!switched) {
+        throw new Error('切换账号失败')
+      }
+
+      const result = await window.electronAPI.wcdb.testConnection(target.dbPath, target.decryptKey, target.wxid)
+      if (!result.success) {
+        throw new Error(result.error || '账号重连失败')
+      }
+
+      await window.electronAPI.chat.close()
+      await window.electronAPI.chat.refreshCache()
+      await window.electronAPI.chat.connect()
+      setDbConnected(true, target.dbPath)
+      setCurrentWxid(target.wxid)
+      await refreshAccountsState(target.id)
+      showMessage(`已切换到账号：${getAccountDisplayName(target)}`, true)
+    } catch (e) {
+      showMessage(`切换账号失败: ${e}`, false)
+    } finally {
+      setIsLoadingState(false)
+      setLoading(false)
+    }
+  }
+
+  const handleDeleteAccount = (account: AccountProfile) => {
+    setSecurityConfirm({
+      show: true,
+      title: '删除账号',
+      message: `删除账号 ${getAccountDisplayName(account)}？此操作仅删除配置，不删除本地解密数据。`,
+      onConfirm: async () => {
+        const result = await configService.deleteAccount(account.id, false)
+        if (result.success) {
+          await refreshAccountsState(result.nextActiveAccountId)
+          showMessage('账号已删除', true)
+        } else {
+          showMessage(result.error || '删除账号失败', false)
+        }
+        setSecurityConfirm(prev => ({ ...prev, show: false }))
+      }
+    })
+  }
+
+  const handleDeleteAccountWithLocalData = (account: AccountProfile) => {
+    setSecurityConfirm({
+      show: true,
+      title: '删除账号并清理本地数据',
+      message: `将删除账号 ${getAccountDisplayName(account)} 的配置，并尝试删除该账号对应的本地解密数据库缓存。`,
+      onConfirm: async () => {
+        const result = await configService.deleteAccount(account.id, true)
+        if (result.success) {
+          await refreshAccountsState(result.nextActiveAccountId)
+          showMessage('账号及其本地数据已删除', true)
+        } else {
+          showMessage(result.error || '删除账号失败', false)
+        }
+        setSecurityConfirm(prev => ({ ...prev, show: false }))
+      }
+    })
+  }
+
+  const handleClearCurrentAccountConfig = (deleteLocalData = false) => {
+    setSecurityConfirm({
+      show: true,
+      title: deleteLocalData ? '清除当前账号并删除本地数据' : '清除当前账号',
+      message: deleteLocalData
+        ? '将清除当前账号配置，并尝试删除该账号对应的本地解密数据库缓存。'
+        : '将只清除当前账号配置，不影响其他账号和全局设置。',
+      onConfirm: async () => {
+        const result = await window.electronAPI.cache.clearCurrentAccount(deleteLocalData)
+        if (result.success) {
+          await refreshAccountsState(activeAccountId)
+          showMessage('当前账号配置已清除', true)
+        } else {
+          showMessage(result.error || '清除当前账号失败', false)
+        }
+        setSecurityConfirm(prev => ({ ...prev, show: false }))
+      }
+    })
+  }
+
+  const handleClearAllAccountConfigs = () => {
+    setSecurityConfirm({
+      show: true,
+      title: '清空全部账号配置',
+      message: '将删除所有账号配置和账号级密钥/路径信息，不会删除主题、AI、MCP、HTTP API 等通用设置。',
+      onConfirm: async () => {
+        const result = await window.electronAPI.cache.clearAllAccountConfigs()
+        if (result.success) {
+          await refreshAccountsState()
+          await loadConfig()
+          showMessage('已清空全部账号配置', true)
+        } else {
+          showMessage(result.error || '清空全部账号配置失败', false)
+        }
+        setSecurityConfirm(prev => ({ ...prev, show: false }))
+      }
+    })
   }
 
   const handleSelectDbPath = async () => {
@@ -749,10 +1233,36 @@ function SettingsPage() {
         setWxidOptions([])
         setShowWxidDropdown(false)
       } else {
-        // 多个账号，显示选择下拉框
+        let selectedWxid = ''
+
+        if (decryptKey.length === 64) {
+          const resolved = await window.electronAPI.wcdb.resolveValidWxid(dbPath, decryptKey)
+          if (resolved.success && resolved.wxid && wxids.includes(resolved.wxid)) {
+            selectedWxid = resolved.wxid
+            setWxid(selectedWxid)
+          }
+        }
+
+        if (!selectedWxid) {
+          let accountInfo = await window.electronAPI.wxKey.detectCurrentAccount(dbPath, 10)
+          if (!accountInfo) {
+            accountInfo = await window.electronAPI.wxKey.detectCurrentAccount(dbPath, 60)
+          }
+
+          if (accountInfo && wxids.includes(accountInfo.wxid)) {
+            selectedWxid = accountInfo.wxid
+            setWxid(selectedWxid)
+          }
+        }
+
         setWxidOptions(wxids)
         setShowWxidDropdown(true)
-        showMessage(`检测到 ${wxids.length} 个候选账号目录，请选择后验证`, true)
+        showMessage(
+          selectedWxid
+            ? `检测到 ${wxids.length} 个候选账号目录，已按最新活动优先选择：${selectedWxid}`
+            : `检测到 ${wxids.length} 个候选账号目录，请选择后验证`,
+          true
+        )
       }
     } catch (e) {
       showMessage(`扫描失败: ${e}`, false)
@@ -779,7 +1289,6 @@ function SettingsPage() {
       const result = await window.electronAPI.wcdb.testConnection(dbPath, decryptKey, wxid)
       if (result.success) {
         setIsAccountVerified(true)
-        await configService.setMyWxid(wxid)
         showMessage(`账号目录验证成功：${wxid}`, true)
       } else {
         setIsAccountVerified(false)
@@ -821,15 +1330,20 @@ function SettingsPage() {
 
     try {
       // 保存数据库相关配置
-      if (decryptKey) await configService.setDecryptKey(decryptKey)
-      if (dbPath) await configService.setDbPath(dbPath)
-      if (wxid) await configService.setMyWxid(wxid)
-      await configService.setCachePath(cachePath)
+      let savedAccount: AccountProfile | null = null
+      const accountPayload = buildAccountPayload()
+
+      if (editingAccountId) {
+        savedAccount = await configService.updateAccount(editingAccountId, accountPayload)
+      } else if (accountPayload.wxid || accountPayload.dbPath || accountPayload.decryptKey || accountPayload.cachePath) {
+        savedAccount = await configService.saveAccount(accountPayload)
+      }
+
+      if (savedAccount) {
+        setEditingAccountId(savedAccount.id)
+      }
 
       // 保存图片密钥（包括空值）
-      await configService.setImageXorKey(imageXorKey)
-      await configService.setImageAesKey(imageAesKey)
-
       // 保存导出路径
       if (exportPath) await configService.setExportPath(exportPath)
 
@@ -859,8 +1373,15 @@ function SettingsPage() {
       await configService.setAiCustomSystemPrompt(aiCustomSystemPrompt)
       await configService.setAiEnableThinking(aiEnableThinking)
       await configService.setAiMessageLimit(aiMessageLimit)
-      await configService.setMcpEnabled(mcpEnabled)
-      await configService.setMcpExposeMediaPaths(mcpExposeMediaPaths)
+
+      await configService.setSttMode(sttMode)
+      await configService.setSttOnlineProvider(sttOnlineProvider)
+      await configService.setSttOnlineApiKey(sttOnlineApiKey)
+      await configService.setSttOnlineBaseURL(sttOnlineBaseURL)
+      await configService.setSttOnlineModel(sttOnlineModel)
+      await configService.setSttOnlineLanguage(sttOnlineLanguage)
+      await configService.setSttOnlineTimeoutMs(sttOnlineTimeoutMs)
+      await configService.setSttOnlineMaxConcurrency(sttOnlineMaxConcurrency)
 
       // 保存关闭行为配置
       await configService.setCloseToTray(closeToTray)
@@ -869,6 +1390,8 @@ function SettingsPage() {
       if (decryptKey && dbPath && wxid && decryptKey.length === 64 && isAccountVerified) {
         setDbConnected(true, dbPath)
       }
+
+      await refreshAccountsState(savedAccount?.id || editingAccountId)
 
       showMessage('配置保存成功', true)
       
@@ -883,6 +1406,14 @@ function SettingsPage() {
         exportPath,
         sttLanguages,
         sttModelType,
+        sttMode,
+        sttOnlineProvider,
+        sttOnlineApiKey,
+        sttOnlineBaseURL,
+        sttOnlineModel,
+        sttOnlineLanguage,
+        sttOnlineTimeoutMs,
+        sttOnlineMaxConcurrency,
         skipIntegrityCheck,
         autoUpdateDatabase,
         autoUpdateCheckInterval,
@@ -900,9 +1431,8 @@ function SettingsPage() {
         aiCustomSystemPrompt,
         aiEnableThinking,
         aiMessageLimit,
-        mcpEnabled,
-        mcpExposeMediaPaths,
-        closeToTray
+        closeToTray,
+        editingAccountId: savedAccount?.id || editingAccountId
       })
       setHasUnsavedChanges(false)
     } catch (e) {
@@ -1061,9 +1591,64 @@ function SettingsPage() {
       {/* 引导窗口按钮 */}
       <div className="form-group">
         <button className="btn btn-secondary" onClick={handleOpenWelcomeWindow}>
-          <Zap size={16} /> 打开配置引导窗口
+          <Zap size={16} /> 新增账号引导
         </button>
-        <span className="form-hint">使用引导窗口一步步完成配置</span>
+        <span className="form-hint">使用引导窗口一步步新增账号，不会覆盖其他已保存账号</span>
+      </div>
+
+      <h3 className="section-title">账号管理</h3>
+      <div className="form-group">
+        <div className="form-hint" style={{ marginBottom: '10px' }}>
+          当前激活账号：{getAccountDisplayName(accountsList.find(item => item.id === activeAccountId) || null) || '未设置'}
+        </div>
+        {accountsList.length > 0 ? (
+          <div className="wxid-options">
+            {accountsList.map((account) => (
+              <button
+                key={account.id}
+                className={`wxid-option ${editingAccountId === account.id ? 'is-selected' : ''}`}
+                onClick={() => handleSelectAccountForEdit(account)}
+              >
+                <div className="wxid-option-name">
+                  {getAccountDisplayName(account)}
+                  {account.id === activeAccountId ? '（当前激活）' : ''}
+                </div>
+                <div className="field-hint">微信 ID：{account.wxid || '未设置'}</div>
+                <div className="field-hint">{account.dbPath || '未设置数据库路径'}</div>
+              </button>
+            ))}
+          </div>
+        ) : (
+          <div className="form-hint">当前还没有已保存账号，请先新增一个账号。</div>
+        )}
+        <div className="btn-row" style={{ marginTop: '12px' }}>
+          <button className="btn btn-secondary" onClick={handleSaveConfig} disabled={isLoading}>
+            <Save size={16} /> 使用当前表单更新此账号
+          </button>
+          <button className="btn btn-secondary" onClick={handleSwitchAccountAndReconnect} disabled={!editingAccountId || editingAccountId === activeAccountId || isLoading}>
+            <RefreshCw size={16} /> 切换并重连
+          </button>
+          <button
+            className="btn btn-danger"
+            onClick={() => {
+              const account = accountsList.find(item => item.id === editingAccountId)
+              if (account) handleDeleteAccount(account)
+            }}
+            disabled={!editingAccountId || isLoading}
+          >
+            <Trash2 size={16} /> 删除账号
+          </button>
+          <button
+            className="btn btn-danger"
+            onClick={() => {
+              const account = accountsList.find(item => item.id === editingAccountId)
+              if (account) handleDeleteAccountWithLocalData(account)
+            }}
+            disabled={!editingAccountId || isLoading}
+          >
+            <Trash2 size={16} /> 删除并清理数据
+          </button>
+        </div>
       </div>
 
       {/* 数据库解密部分 */}
@@ -1225,7 +1810,7 @@ function SettingsPage() {
 
       <div className="form-group">
         <label>解密密钥</label>
-        <span className="form-hint">64位十六进制密钥</span>
+        <span className="form-hint">{isMac ? '64位十六进制 DbKey，macOS 通过 helper + 断点捕获获取' : '64位十六进制密钥'}</span>
         <div className="input-with-toggle">
           <input type={showDecryptKey ? 'text' : 'password'} placeholder="例如: a1b2c3d4e5f6..." value={decryptKey} onChange={(e) => setDecryptKey(e.target.value)} />
           <button type="button" className="toggle-visibility" onClick={() => setShowDecryptKey(!showDecryptKey)}>
@@ -1239,12 +1824,24 @@ function SettingsPage() {
           </button>
           {isGettingKey && <button className="btn btn-secondary" onClick={handleCancelGetKey}><X size={16} /> 取消</button>}
         </div>
+        <span className="form-hint">
+          {isMac
+            ? 'macOS 要求先关闭 SIP；点击后会请求管理员授权，并在微信访问数据库时返回最终 DbKey。'
+            : '点击后会自动启动微信并等待 Hook 安装完成。'}
+        </span>
       </div>
 
       <div className="form-group">
         <label>数据库根目录</label>
-        <span className="form-hint">xwechat_files 目录</span>
-        <input type="text" placeholder="例如: C:\Users\xxx\Documents\xwechat_files" value={dbPath} onChange={(e) => setDbPath(e.target.value)} />
+        <span className="form-hint">{isMac ? '微信版本目录或旧版 xwechat_files 根目录' : 'xwechat_files 目录'}</span>
+        <input
+          type="text"
+          placeholder={isMac
+            ? '例如: ~/Library/Containers/com.tencent.xinWeChat/Data/Library/Application Support/com.tencent.xinWeChat/2.0b4.0.9'
+            : '例如: C:\\Users\\xxx\\Documents\\xwechat_files'}
+          value={dbPath}
+          onChange={(e) => setDbPath(e.target.value)}
+        />
         <button className="btn btn-primary" onClick={handleSelectDbPath}><FolderOpen size={16} /> 浏览选择</button>
       </div>
 
@@ -1294,8 +1891,13 @@ function SettingsPage() {
 
       <div className="form-group">
         <label>缓存目录 <span className="optional">(可选)</span></label>
-        <span className="form-hint">留空使用默认目录，尽可能不选择C盘</span>
-        <input type="text" placeholder="留空使用默认目录" value={cachePath} onChange={(e) => setCachePath(e.target.value)} />
+        <span className="form-hint">{isMac ? '留空使用文稿目录下的 CipherTalkData' : '留空使用默认目录，尽可能不选择C盘'}</span>
+        <input
+          type="text"
+          placeholder={isMac ? '~/Documents/CipherTalkData' : '留空使用默认目录'}
+          value={cachePath}
+          onChange={(e) => setCachePath(e.target.value)}
+        />
         <div className="btn-row">
           <button className="btn btn-secondary" onClick={handleSelectCachePath}><FolderOpen size={16} /> 浏览选择</button>
           <button className="btn btn-secondary" onClick={() => setCachePath('')}><RotateCcw size={16} /> 恢复默认</button>
@@ -1333,7 +1935,7 @@ function SettingsPage() {
 
       <div className="form-group">
         <label>XOR 密钥</label>
-        <span className="form-hint">2位十六进制，如 0x53</span>
+        <span className="form-hint">{isMac ? 'kvcomm 校验成功后返回的 XOR 密钥，格式如 0x53' : '2位十六进制，如 0x53'}</span>
         <div className="input-with-toggle">
           <input type={showXorKey ? 'text' : 'password'} placeholder="例如: 0x12" value={imageXorKey} onChange={(e) => setImageXorKey(e.target.value)} />
           <button type="button" className="toggle-visibility" onClick={() => setShowXorKey(!showXorKey)}>
@@ -1344,7 +1946,7 @@ function SettingsPage() {
 
       <div className="form-group">
         <label>AES 密钥</label>
-        <span className="form-hint">至少16个字符（V4版本图片需要）</span>
+        <span className="form-hint">{isMac ? '16位字符串；优先走 kvcomm + wxid 验真，失败才回退到内存扫描' : '至少16个字符（V4版本图片需要）'}</span>
         <div className="input-with-toggle">
           <input type={showAesKey ? 'text' : 'password'} placeholder="例如: b123456789012345..." value={imageAesKey} onChange={(e) => setImageAesKey(e.target.value)} />
           <button type="button" className="toggle-visibility" onClick={() => setShowAesKey(!showAesKey)}>
@@ -1358,6 +1960,9 @@ function SettingsPage() {
       <button className="btn btn-primary" onClick={handleGetImageKey} disabled={isGettingImageKey}>
         <ImageIcon size={16} /> {isGettingImageKey ? '获取中...' : '自动获取图片密钥'}
       </button>
+      <span className="form-hint">
+        {isMac ? '优先扫描 kvcomm 和模板文件；只有前者不可用时才回退到微信进程内存扫描。' : '请先在电脑微信中打开几张图片，再执行自动获取。'}
+      </span>
     </div>
   )
 
@@ -1380,7 +1985,8 @@ function SettingsPage() {
 
     try {
       // 构建用户目录路径（用于 wxid 匹配）
-      const userDir = `${dbPath}\\${wxid}`
+      const separator = dbPath.includes('\\') && !dbPath.includes('/') ? '\\' : '/'
+      const userDir = `${dbPath.replace(/[\\/]+$/, '')}${separator}${wxid}`
 
       const removeListener = window.electronAPI.imageKey.onProgress((msg) => {
         setImageKeyStatus(msg)
@@ -1393,11 +1999,9 @@ function SettingsPage() {
         if (result.xorKey !== undefined) {
           const xorKeyHex = `0x${result.xorKey.toString(16).padStart(2, '0')}`
           setImageXorKey(xorKeyHex)
-          await configService.setImageXorKey(xorKeyHex)
         }
         if (result.aesKey) {
           setImageAesKey(result.aesKey)
-          await configService.setImageAesKey(result.aesKey)
         }
         showMessage('图片密钥获取成功！', true)
         setImageKeyStatus('')
@@ -1433,9 +2037,6 @@ function SettingsPage() {
   const [isDownloadingGpuComponents, setIsDownloadingGpuComponents] = useState(false)
   const [gpuDownloadProgress, setGpuDownloadProgress] = useState({ overallProgress: 0, currentFile: '' })
 
-  // ========== STT 模式切换 ==========
-  const [sttMode, setSttMode] = useState<'cpu' | 'gpu'>('cpu')
-
   // 加载 STT 模型状态
   useEffect(() => {
     if (activeTab === 'stt') {
@@ -1447,14 +2048,37 @@ function SettingsPage() {
   }, [activeTab])
 
   const loadSttMode = async () => {
-    const savedMode = await window.electronAPI.config.get('sttMode') as 'cpu' | 'gpu' | undefined
+    const savedMode = await configService.getSttMode()
     setSttMode(savedMode || 'cpu')
   }
 
-  const handleSttModeChange = async (mode: 'cpu' | 'gpu') => {
+  const handleSttModeChange = async (mode: 'cpu' | 'gpu' | 'online') => {
     setSttMode(mode)
-    await window.electronAPI.config.set('sttMode', mode)
-    showMessage(mode === 'cpu' ? '已切换到 CPU 模式 (SenseVoice)' : '已切换到 GPU 模式 (Whisper)', true)
+    await configService.setSttMode(mode)
+    showMessage(
+      mode === 'cpu'
+        ? '已切换到 CPU 模式 (SenseVoice)'
+        : mode === 'gpu'
+          ? '已切换到 GPU 模式 (Whisper)'
+          : '已切换到在线模式 (OpenAI 兼容)',
+      true
+    )
+  }
+
+  const handleTestOnlineSttConfig = async () => {
+    const result = await window.electronAPI.stt.testOnlineConfig({
+      provider: sttOnlineProvider,
+      apiKey: sttOnlineApiKey,
+      baseURL: sttOnlineBaseURL,
+      model: sttOnlineModel,
+      language: sttOnlineLanguage,
+      timeoutMs: sttOnlineTimeoutMs
+    })
+    if (result.success) {
+      showMessage('在线转写配置测试成功', true)
+    } else {
+      showMessage(result.error || '在线转写配置测试失败', false)
+    }
   }
 
   // 监听 STT 下载进度
@@ -1673,6 +2297,12 @@ function SettingsPage() {
           onClick={() => handleSttModeChange('gpu')}
         >
           <Zap size={16} /> GPU 模式
+        </button>
+        <button
+          className={`mode-btn ${sttMode === 'online' ? 'active' : ''}`}
+          onClick={() => handleSttModeChange('online')}
+        >
+          <Plug size={16} /> 在线模式
         </button>
       </div>
 
@@ -2155,18 +2785,194 @@ function SettingsPage() {
         </>
       )}
 
-      <h3 className="section-title" style={{ marginTop: '2rem' }}>使用说明</h3>
-      <div className="stt-instructions">
-        <ol>
-          <li>选择 CPU 或 GPU 模式</li>
-          <li>下载对应的语音识别模型（仅需一次）</li>
-          <li>在聊天记录中点击语音消息</li>
-          <li>点击"转文字"按钮即可将语音转换为文字</li>
-        </ol>
-        <p className="note">
-          <strong>注意：</strong>所有语音识别均在本地完成，不会上传任何数据，保护您的隐私。
-        </p>
-      </div>
+      {sttMode === 'online' && (
+        <div className="stt-online-settings">
+          <h3 className="section-title">在线语音转写</h3>
+          <p className="section-desc">
+            使用在线接口进行语音转文字，无需下载本地模型。语音数据会发送到第三方服务，可能产生网络延迟与 API 费用。
+          </p>
+
+          <div className="form-group">
+            <label>提供商</label>
+            <span className="form-hint">
+              {sttOnlineProvider === 'openai-compatible'
+                ? '选择 OpenAI 兼容时会自动补全标准路径'
+                : sttOnlineProvider === 'aliyun-qwen-asr'
+                  ? '阿里云走 DashScope 兼容入口，但内部使用 chat/completions + input_audio 协议'
+                  : '自定义接口会直接使用你填写的完整 URL'}
+            </span>
+            <div className="theme-mode-toggle" style={{ marginBottom: 0 }}>
+              {sttOnlineProviderOptions.map((option) => (
+                <button
+                  key={option.value}
+                  type="button"
+                  className={`mode-btn ${sttOnlineProvider === option.value ? 'active' : ''}`}
+                  onClick={() => {
+                    setSttOnlineProvider(option.value)
+
+                    if (option.value === 'aliyun-qwen-asr') {
+                      if (!sttOnlineBaseURL || sttOnlineBaseURL === STT_ONLINE_DEFAULTS['openai-compatible'].baseURL) {
+                        setSttOnlineBaseURL(STT_ONLINE_DEFAULTS['aliyun-qwen-asr'].baseURL)
+                      }
+                      if (!sttOnlineModel || sttOnlineModel === STT_ONLINE_DEFAULTS['openai-compatible'].model) {
+                        setSttOnlineModel(STT_ONLINE_DEFAULTS['aliyun-qwen-asr'].model)
+                      }
+                    } else if (option.value === 'openai-compatible') {
+                      if (!sttOnlineBaseURL || sttOnlineBaseURL === STT_ONLINE_DEFAULTS['aliyun-qwen-asr'].baseURL) {
+                        setSttOnlineBaseURL(STT_ONLINE_DEFAULTS['openai-compatible'].baseURL)
+                      }
+                      if (!sttOnlineModel || sttOnlineModel === STT_ONLINE_DEFAULTS['aliyun-qwen-asr'].model) {
+                        setSttOnlineModel(STT_ONLINE_DEFAULTS['openai-compatible'].model)
+                      }
+                    }
+                  }}
+                >
+                  {option.label}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="form-group">
+            <label>接口 URL</label>
+            <span className="form-hint">
+              {sttOnlineProvider === 'openai-compatible'
+                ? '支持填写完整接口 URL，如 `https://api.openai.com/v1/audio/transcriptions`；也兼容只填 `/v1` 基地址'
+                : sttOnlineProvider === 'aliyun-qwen-asr'
+                  ? '建议填写 DashScope 兼容入口，如 `https://dashscope.aliyuncs.com/compatible-mode/v1`'
+                  : '请输入完整接口 URL，系统会按你填写的地址原样发起请求'}
+            </span>
+            <input
+              type="text"
+              value={sttOnlineBaseURL}
+              onChange={(e) => setSttOnlineBaseURL(e.target.value)}
+              placeholder={
+                sttOnlineProvider === 'openai-compatible'
+                  ? 'https://api.openai.com/v1/audio/transcriptions'
+                  : sttOnlineProvider === 'aliyun-qwen-asr'
+                    ? 'https://dashscope.aliyuncs.com/compatible-mode/v1'
+                    : 'https://your-api.example.com/full/path'
+              }
+            />
+          </div>
+
+          <div className="form-group">
+            <label>API Key</label>
+            <span className="form-hint">用于调用在线语音识别接口</span>
+            <input
+              type="password"
+              value={sttOnlineApiKey}
+              onChange={(e) => setSttOnlineApiKey(e.target.value)}
+              placeholder="请输入在线 STT API Key"
+            />
+          </div>
+
+          <div className="form-group">
+            <label>模型名称</label>
+            <span className="form-hint">
+              {sttOnlineProvider === 'aliyun-qwen-asr'
+                ? '阿里云当前可用模型为 `qwen3-asr-flash` 与 `qwen3-asr-flash-filetrans`，默认使用 `qwen3-asr-flash`'
+                : '默认使用 `gpt-4o-mini-transcribe`，也可替换为兼容模型名'}
+            </span>
+            <input
+              type="text"
+              value={sttOnlineModel}
+              onChange={(e) => setSttOnlineModel(e.target.value)}
+              placeholder={sttOnlineProvider === 'aliyun-qwen-asr' ? 'qwen3-asr-flash' : 'gpt-4o-mini-transcribe'}
+            />
+          </div>
+
+          <div className="advanced-params-grid">
+            <div className="param-item">
+              <label>识别语言</label>
+              <div className="custom-select" ref={sttOnlineLanguageRef}>
+                <button
+                  type="button"
+                  className={`custom-select-trigger ${showSttOnlineLanguageDropdown ? 'is-open' : ''}`}
+                  onClick={() => setShowSttOnlineLanguageDropdown(prev => !prev)}
+                >
+                  <span>{sttOnlineLanguageOptions.find(option => option.value === sttOnlineLanguage)?.label || '自动识别'}</span>
+                  <ChevronDown size={16} />
+                </button>
+                {showSttOnlineLanguageDropdown && (
+                  <div className="custom-select-menu">
+                    {sttOnlineLanguageOptions.map((option) => (
+                      <button
+                        key={option.value}
+                        type="button"
+                        className={`custom-select-option ${sttOnlineLanguage === option.value ? 'is-active' : ''}`}
+                        onClick={() => {
+                          setSttOnlineLanguage(option.value)
+                          setShowSttOnlineLanguageDropdown(false)
+                        }}
+                      >
+                        <span>{option.label}</span>
+                        {sttOnlineLanguage === option.value && <Check size={14} />}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+
+            <div className="param-item">
+              <label>超时时间（毫秒）</label>
+              <div className="number-control">
+                <button className="control-btn minus" type="button" onClick={() => setSttOnlineTimeoutMs(prev => Math.max(5000, prev - 5000))}>
+                  <Minus size={14} />
+                </button>
+                <div className="value-display">
+                  <input
+                    type="number"
+                    value={sttOnlineTimeoutMs}
+                    onChange={(e) => setSttOnlineTimeoutMs(Math.max(5000, Number(e.target.value) || 60000))}
+                  />
+                </div>
+                <button className="control-btn plus" type="button" onClick={() => setSttOnlineTimeoutMs(prev => Math.min(300000, prev + 5000))}>
+                  <Plus size={14} />
+                </button>
+              </div>
+            </div>
+
+            <div className="param-item">
+              <label>批量并发数</label>
+              <div className="number-control">
+                <button className="control-btn minus" type="button" onClick={() => setSttOnlineMaxConcurrency(prev => Math.max(1, prev - 1))}>
+                  <Minus size={14} />
+                </button>
+                <div className="value-display">
+                  <input
+                    type="number"
+                    value={sttOnlineMaxConcurrency}
+                    onChange={(e) => setSttOnlineMaxConcurrency(Math.max(1, Math.min(10, Number(e.target.value) || 2)))}
+                  />
+                </div>
+                <button className="control-btn plus" type="button" onClick={() => setSttOnlineMaxConcurrency(prev => Math.min(10, prev + 1))}>
+                  <Plus size={14} />
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <div className="btn-row" style={{ marginTop: '1rem' }}>
+            <button className="btn btn-secondary" onClick={handleTestOnlineSttConfig}>
+              <Plug size={16} /> 测试在线配置
+            </button>
+          </div>
+
+          <div className="stt-instructions" style={{ marginTop: '1.5rem' }}>
+            <ol>
+              <li>在线模式会把语音文件发送到第三方 STT 服务进行识别</li>
+              <li>识别效果取决于服务商模型、网络状况和接口限流策略</li>
+              <li>批量转写会按并发数逐批发送，避免触发过高频率限制</li>
+            </ol>
+            <p className="note">
+              <strong>注意：</strong>在线模式不再依赖本地模型下载，但会产生隐私和费用成本，请确认后再使用。
+            </p>
+          </div>
+        </div>
+      )}
+
     </div>
   )
 
@@ -2190,7 +2996,7 @@ function SettingsPage() {
         show: true,
         title: '切换认证方式',
         message: method === 'biometric'
-          ? '切换到 Windows Hello 将清除当前的密码设置，是否继续？'
+          ? `切换到${biometricLabel}将清除当前的密码设置，是否继续？`
           : '切换到密码认证将清除当前的生物识别设置，是否继续？',
         onConfirm: async () => {
           await disableAuth()
@@ -2214,10 +3020,10 @@ function SettingsPage() {
   }
 
   const activateBiometric = async () => {
-    showMessage('正在等待 Windows Hello 验证...', true)
+    showMessage(`正在等待${biometricLabel}验证...`, true)
     const result = await enableAuth()
     if (result.success) {
-      showMessage('已启用 Windows Hello', true)
+      showMessage(`已启用${biometricLabel}`, true)
       setShowPasswordInput(false)
     } else {
       showMessage(result.error || '启用失败', false)
@@ -2227,10 +3033,11 @@ function SettingsPage() {
   const renderSecurityTab = () => (
     <div className="tab-content">
       <h3 className="section-title">安全保护</h3>
-      <div className="section-desc">配置应用启动时的安全验证方式，保护您的隐私数据。</div>
+      <div className="section-desc">
+        {isMac ? '配置应用启动时的安全验证方式。macOS 优先使用 Touch ID，设备不支持时可改用自定义密码。' : '配置应用启动时的安全验证方式，保护您的隐私数据。'}
+      </div>
 
       <div className="security-grid">
-        {/* Windows Hello Card */}
         <div
           className={`security-card ${isAuthEnabled && authMethod === 'biometric' ? 'active' : ''}`}
           onClick={() => handleSecurityMethodSelect('biometric')}
@@ -2242,14 +3049,14 @@ function SettingsPage() {
                 <Lock size={20} />
               </div>
               <div className="preview-badge">
-                <Fingerprint /> Windows Hello
+                <Fingerprint /> {biometricLabel}
               </div>
               <div className="preview-btn" />
             </div>
           </div>
           <div className="security-content">
             <div className="security-header">
-              <span className="security-title">Windows Hello</span>
+              <span className="security-title">{biometricLabel}</span>
               {isAuthEnabled && authMethod === 'biometric' && (
                 <div className="theme-check" style={{ position: 'relative', top: 0, right: 0, transform: 'scale(1)', background: 'var(--primary)', boxShadow: 'none' }}>
                   <Check size={12} />
@@ -2257,7 +3064,9 @@ function SettingsPage() {
               )}
             </div>
             <div className="security-desc">
-              使用系统的面部识别、指纹或 PIN 码进行验证。体验最流畅，安全性高。
+              {isMac
+                ? '使用 macOS 系统 Touch ID 进行验证。设备未启用或不支持时，请改用自定义密码。'
+                : '使用系统的面部识别、指纹或 PIN 码进行验证。体验最流畅，安全性高。'}
             </div>
           </div>
         </div>
@@ -2287,7 +3096,9 @@ function SettingsPage() {
               )}
             </div>
             <div className="security-desc">
-              设置应用专属密码。如果不方便使用生物识别，或者需要在多台设备间同步配置时推荐。
+              {isMac
+                ? '设置应用专属密码。当前 macOS 侧只提供这一种应用锁方式。'
+                : '设置应用专属密码。如果不方便使用生物识别，或者需要在多台设备间同步配置时推荐。'}
             </div>
 
             {/* Input area - prevent click propagation to avoid toggling card off while typing */}
@@ -2348,12 +3159,12 @@ function SettingsPage() {
               >
                 取消
               </button>
-              <button
-                className="btn btn-primary"
-                onClick={securityConfirm.onConfirm}
-              >
-                确定切换
-              </button>
+                <button
+                  className="btn btn-primary"
+                  onClick={securityConfirm.onConfirm}
+                >
+                  确定
+                </button>
             </div>
           </div>
         </div>
@@ -2484,10 +3295,16 @@ function SettingsPage() {
                 <span className="cache-card-label">配置信息</span>
               </div>
               <div className="cache-card-desc">密钥、路径等</div>
-              <button type="button" className="btn btn-secondary cache-card-btn" onClick={handleClearConfig}>
-                <Trash2 size={14} /> 清除配置
-              </button>
-            </div>
+                <button type="button" className="btn btn-secondary cache-card-btn" onClick={handleClearCurrentAccount}>
+                  <Trash2 size={14} /> 清除当前账号
+                </button>
+                <button type="button" className="btn btn-secondary cache-card-btn" onClick={handleClearCurrentAccountConfig.bind(null, true)}>
+                  <Trash2 size={14} /> 删除当前账号并清理数据
+                </button>
+                <button type="button" className="btn btn-danger cache-card-btn" onClick={handleClearAllAccounts}>
+                  <Trash2 size={14} /> 清空全部账号配置
+                </button>
+              </div>
             <div className="cache-card cache-card-total">
               <div className="cache-card-header">
                 <Layers size={20} className="cache-card-icon" />
@@ -2658,8 +3475,23 @@ function SettingsPage() {
   useEffect(() => {
     if (location.state?.updateInfo) {
       setUpdateInfo(location.state.updateInfo)
+      const phase = location.state.updateInfo.diagnostics?.phase
+      setIsDownloading(phase === 'downloading' || phase === 'installing')
+      if (typeof location.state.updateInfo.diagnostics?.progressPercent === 'number') {
+        setDownloadProgress(location.state.updateInfo.diagnostics.progressPercent)
+      }
+    } else {
+      syncUpdateState()
     }
   }, [location.state])
+
+  useEffect(() => {
+    window.electronAPI.app.getUpdateSourceInfo?.().then((info) => {
+      setUpdateSourceInfo(info)
+    }).catch((error) => {
+      console.error('获取更新源信息失败:', error)
+    })
+  }, [])
 
   const renderAboutTab = () => (
     <div className="tab-content about-tab">
@@ -2672,24 +3504,58 @@ function SettingsPage() {
         <p className="about-version">v{appVersion || '...'}</p>
 
         <div className="about-update">
+          {updateSourceInfo && (
+            <div className="update-hint" style={{ marginBottom: '10px' }}>
+              主更新源：GitHub Release ({updateSourceInfo.githubRepository.owner}/{updateSourceInfo.githubRepository.repo})<br />
+              策略补充源：{updateSourceInfo.forceUpdatePolicyFallbackUrl}
+            </div>
+          )}
           {updateInfo?.hasUpdate ? (
             <>
-              <p className="update-hint">新版本 v{updateInfo.version} 可用</p>
+              <p className="update-hint">
+                {isDownloading ? `正在下载 v${updateInfo.version}` : updateInfo.forceUpdate ? '检测到强制更新' : `新版本 v${updateInfo.version} 可用`}
+              </p>
+              <p className="update-hint">
+                更新来源：{updateInfo.updateSource === 'github' ? 'GitHub Release' : '未知'} / 策略来源：
+                {updateInfo.policySource === 'github' ? 'GitHub' : updateInfo.policySource === 'custom' ? '自定义源' : '无'}
+              </p>
+              {updateInfo.forceUpdate && updateInfo.minimumSupportedVersion && (
+                <p className="update-hint">最低安全版本：v{updateInfo.minimumSupportedVersion}</p>
+              )}
+              {updateInfo.diagnostics && (
+                <div className="update-hint" style={{ marginTop: '8px' }}>
+                  更新诊断：{updateInfo.diagnostics.phase}
+                  {updateInfo.diagnostics.fallbackToFull ? ' / 已从差分回退到全量' : ''}
+                  {updateInfo.diagnostics.lastEvent ? <><br />最近事件：{updateInfo.diagnostics.lastEvent}</> : null}
+                  {updateInfo.diagnostics.lastError ? <><br />最近错误：{updateInfo.diagnostics.lastError}</> : null}
+                  <br />
+                  详细诊断请查看日志文件中的 AppUpdate 记录。
+                </div>
+              )}
               {isDownloading ? (
                 <div className="download-progress">
-                  <div className="progress-bar">
-                    <div className="progress-fill" style={{ width: `${downloadProgress}%` }} />
+                  <div className="progress-main">
+                    <div className="progress-bar">
+                      <div className="progress-fill" style={{ width: `${downloadProgress}%` }} />
+                    </div>
+                    <span>{downloadProgress.toFixed(0)}%</span>
                   </div>
-                  <span>{downloadProgress.toFixed(0)}%</span>
+                  <div className="progress-meta">
+                    <span>
+                      {formatFileSize(downloadProgressDetail?.transferred ?? updateInfo.diagnostics?.downloadedBytes ?? 0)} / {formatFileSize(downloadProgressDetail?.total ?? updateInfo.diagnostics?.totalBytes ?? 0)}
+                    </span>
+                    <span>速度 {formatSpeed(downloadProgressDetail?.bytesPerSecond ?? 0)}</span>
+                    {updateInfo.diagnostics?.fallbackToFull ? <span>已回退全量下载</span> : null}
+                  </div>
                 </div>
               ) : (
-                <button className="btn btn-primary" onClick={handleUpdateNow}>
+                <button className="btn btn-primary" onClick={handleUpdateNow} disabled={isDownloading}>
                   <Download size={16} /> 立即更新
                 </button>
               )}
             </>
           ) : (
-            <button className="btn btn-secondary" onClick={handleCheckUpdate} disabled={isCheckingUpdate}>
+            <button className="btn btn-secondary" onClick={handleCheckUpdate} disabled={isCheckingUpdate || isDownloading}>
               <RefreshCw size={16} className={isCheckingUpdate ? 'spin' : ''} />
               {isCheckingUpdate ? '检查中...' : '检查更新'}
             </button>
@@ -2802,10 +3668,6 @@ function SettingsPage() {
             setEnableThinking={setAiEnableThinkingState}
             messageLimit={aiMessageLimit}
             setMessageLimit={setAiMessageLimitState}
-            mcpEnabled={mcpEnabled}
-            setMcpEnabled={setMcpEnabledState}
-            mcpExposeMediaPaths={mcpExposeMediaPaths}
-            setMcpExposeMediaPaths={setMcpExposeMediaPathsState}
             showMessage={showMessage}
           />
         )}

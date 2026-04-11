@@ -1,4 +1,28 @@
 import { contextBridge, ipcRenderer } from 'electron'
+import type { AccountProfile } from '../src/types/account'
+
+function getMcpLaunchConfigSafe(): Promise<{
+  command: string
+  args: string[]
+  cwd: string
+  mode: 'dev' | 'packaged'
+} | null> {
+  return new Promise((resolve) => {
+    const requestId = `${Date.now()}-${Math.random().toString(36).slice(2)}`
+    const responseChannel = `app:getMcpLaunchConfig:response:${requestId}`
+    const timeout = setTimeout(() => {
+      ipcRenderer.removeAllListeners(responseChannel)
+      resolve(null)
+    }, 600)
+
+    ipcRenderer.once(responseChannel, (_, payload) => {
+      clearTimeout(timeout)
+      resolve(payload ?? null)
+    })
+
+    ipcRenderer.send('app:getMcpLaunchConfig:request', { requestId })
+  })
+}
 
 // 暴露给渲染进程的 API
 contextBridge.exposeInMainWorld('electronAPI', {
@@ -8,6 +32,22 @@ contextBridge.exposeInMainWorld('electronAPI', {
     set: (key: string, value: any) => ipcRenderer.invoke('config:set', key, value),
     getTldCache: () => ipcRenderer.invoke('config:getTldCache'),
     setTldCache: (tlds: string[]) => ipcRenderer.invoke('config:setTldCache', tlds)
+  },
+
+  accounts: {
+    list: () => ipcRenderer.invoke('accounts:list') as Promise<AccountProfile[]>,
+    getActive: () => ipcRenderer.invoke('accounts:getActive') as Promise<AccountProfile | null>,
+    setActive: (accountId: string) => ipcRenderer.invoke('accounts:setActive', accountId) as Promise<AccountProfile | null>,
+    save: (profile: Omit<AccountProfile, 'id' | 'createdAt' | 'updatedAt' | 'lastUsedAt'>) => ipcRenderer.invoke('accounts:save', profile) as Promise<AccountProfile | null>,
+    update: (accountId: string, patch: Partial<Omit<AccountProfile, 'id' | 'createdAt' | 'updatedAt' | 'lastUsedAt'>>) =>
+      ipcRenderer.invoke('accounts:update', accountId, patch) as Promise<AccountProfile | null>,
+    delete: (accountId: string, deleteLocalData?: boolean) =>
+      ipcRenderer.invoke('accounts:delete', accountId, deleteLocalData) as Promise<{ success: boolean; error?: string; deleted?: AccountProfile | null; nextActiveAccountId?: string }>
+  },
+
+  skillInstaller: {
+    exportSkillZip: (skillName: string) =>
+      ipcRenderer.invoke('skillInstaller:exportSkillZip', skillName) as Promise<{ success: boolean; outputPath?: string; fileName?: string; version?: string; error?: string }>
   },
 
   // 数据库操作
@@ -33,7 +73,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // 文件操作
   file: {
     delete: (filePath: string) => ipcRenderer.invoke('file:delete', filePath),
-    copy: (sourcePath: string, destPath: string) => ipcRenderer.invoke('file:copy', sourcePath, destPath)
+    copy: (sourcePath: string, destPath: string) => ipcRenderer.invoke('file:copy', sourcePath, destPath),
+    writeBase64: (filePath: string, base64Data: string) => ipcRenderer.invoke('file:writeBase64', filePath, base64Data)
   },
 
   // Shell
@@ -47,15 +88,37 @@ contextBridge.exposeInMainWorld('electronAPI', {
   app: {
     getDownloadsPath: () => ipcRenderer.invoke('app:getDownloadsPath'),
     getVersion: () => ipcRenderer.invoke('app:getVersion'),
+    getPlatformInfo: () => ipcRenderer.invoke('app:getPlatformInfo'),
+    getMcpLaunchConfig: () => getMcpLaunchConfigSafe(),
+    getUpdateState: () => ipcRenderer.invoke('app:getUpdateState'),
+    getUpdateSourceInfo: () => ipcRenderer.invoke('app:getUpdateSourceInfo'),
     checkForUpdates: () => ipcRenderer.invoke('app:checkForUpdates'),
     downloadAndInstall: () => ipcRenderer.invoke('app:downloadAndInstall'),
     getStartupDbConnected: () => ipcRenderer.invoke('app:getStartupDbConnected'),
     setAppIcon: (iconName: string) => ipcRenderer.invoke('app:setAppIcon', iconName),
-    onDownloadProgress: (callback: (progress: number) => void) => {
+    onDownloadProgress: (callback: (progress: {
+      percent: number
+      transferred: number
+      total: number
+      bytesPerSecond: number
+    }) => void) => {
       ipcRenderer.on('app:downloadProgress', (_, progress) => callback(progress))
       return () => ipcRenderer.removeAllListeners('app:downloadProgress')
     },
-    onUpdateAvailable: (callback: (info: { version: string; releaseNotes: string }) => void) => {
+    onUpdateAvailable: (callback: (info: {
+      hasUpdate: boolean
+      forceUpdate: boolean
+      currentVersion: string
+      version?: string
+      releaseNotes?: string
+      title?: string
+      message?: string
+      minimumSupportedVersion?: string
+      reason?: 'minimum-version' | 'blocked-version'
+      checkedAt: number
+      updateSource: 'github' | 'custom' | 'none'
+      policySource: 'github' | 'custom' | 'none'
+    }) => void) => {
       ipcRenderer.on('app:updateAvailable', (_, info) => callback(info))
       return () => ipcRenderer.removeAllListeners('app:updateAvailable')
     }
@@ -83,7 +146,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
     openAnnualReportWindow: (year: number) => ipcRenderer.invoke('window:openAnnualReportWindow', year),
     openAgreementWindow: () => ipcRenderer.invoke('window:openAgreementWindow'),
     openPurchaseWindow: () => ipcRenderer.invoke('window:openPurchaseWindow'),
-    openWelcomeWindow: () => ipcRenderer.invoke('window:openWelcomeWindow'),
+    openWelcomeWindow: (mode?: 'default' | 'add-account') => ipcRenderer.invoke('window:openWelcomeWindow', mode),
     completeWelcome: () => ipcRenderer.invoke('window:completeWelcome'),
     isChatWindowOpen: () => ipcRenderer.invoke('window:isChatWindowOpen'),
     closeChatWindow: () => ipcRenderer.invoke('window:closeChatWindow'),
@@ -113,12 +176,17 @@ contextBridge.exposeInMainWorld('electronAPI', {
     }
   },
 
-  // Windows Hello 原生验证 (比 WebAuthn 更快)
-  windowsHello: {
-    isAvailable: () => ipcRenderer.invoke('windowsHello:isAvailable') as Promise<boolean>,
-    verify: (message?: string) => ipcRenderer.invoke('windowsHello:verify', message) as Promise<{
+  systemAuth: {
+    getStatus: () => ipcRenderer.invoke('systemAuth:getStatus') as Promise<{
+      platform: string
+      available: boolean
+      method: 'windows-hello' | 'touch-id' | 'none'
+      displayName: string
+      error?: string
+    }>,
+    verify: (reason?: string) => ipcRenderer.invoke('systemAuth:verify', reason) as Promise<{
       success: boolean
-      result: number  // WindowsHelloResult 枚举值
+      method: 'windows-hello' | 'touch-id' | 'none'
       error?: string
     }>
   },
@@ -130,7 +198,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
     killWeChat: () => ipcRenderer.invoke('wxkey:killWeChat'),
     launchWeChat: () => ipcRenderer.invoke('wxkey:launchWeChat'),
     waitForWindow: (maxWaitSeconds?: number) => ipcRenderer.invoke('wxkey:waitForWindow', maxWaitSeconds),
-    startGetKey: (customWechatPath?: string) => ipcRenderer.invoke('wxkey:startGetKey', customWechatPath),
+    startGetKey: (customWechatPath?: string, dbPath?: string) => ipcRenderer.invoke('wxkey:startGetKey', customWechatPath, dbPath),
     cancel: () => ipcRenderer.invoke('wxkey:cancel'),
     detectCurrentAccount: (dbPath?: string, maxTimeDiffMinutes?: number) => ipcRenderer.invoke('wxkey:detectCurrentAccount', dbPath, maxTimeDiffMinutes),
     onStatus: (callback: (data: { status: string; level: number }) => void) => {
@@ -151,6 +219,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   wcdb: {
     testConnection: (dbPath: string, hexKey: string, wxid: string, isAutoConnect?: boolean) =>
       ipcRenderer.invoke('wcdb:testConnection', dbPath, hexKey, wxid, isAutoConnect),
+    resolveValidWxid: (dbPath: string, hexKey: string) =>
+      ipcRenderer.invoke('wcdb:resolveValidWxid', dbPath, hexKey),
     open: (dbPath: string, hexKey: string, wxid: string) =>
       ipcRenderer.invoke('wcdb:open', dbPath, hexKey, wxid),
     close: () => ipcRenderer.invoke('wcdb:close'),
@@ -253,6 +323,14 @@ contextBridge.exposeInMainWorld('electronAPI', {
       cursorLocalId?: number
     ) =>
       ipcRenderer.invoke('chat:getMessagesBefore', sessionId, cursorSortSeq, limit, cursorCreateTime, cursorLocalId),
+    getMessagesAfter: (
+      sessionId: string,
+      cursorSortSeq: number,
+      limit?: number,
+      cursorCreateTime?: number,
+      cursorLocalId?: number
+    ) =>
+      ipcRenderer.invoke('chat:getMessagesAfter', sessionId, cursorSortSeq, limit, cursorCreateTime, cursorLocalId),
     getAllVoiceMessages: (sessionId: string) =>
       ipcRenderer.invoke('chat:getAllVoiceMessages', sessionId),
     getAllImageMessages: (sessionId: string) =>
@@ -353,6 +431,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
     clearDatabases: () => ipcRenderer.invoke('cache:clearDatabases'),
     clearAll: () => ipcRenderer.invoke('cache:clearAll'),
     clearConfig: () => ipcRenderer.invoke('cache:clearConfig'),
+    clearCurrentAccount: (deleteLocalData?: boolean) => ipcRenderer.invoke('cache:clearCurrentAccount', deleteLocalData),
+    clearAllAccountConfigs: () => ipcRenderer.invoke('cache:clearAllAccountConfigs'),
     getCacheSize: () => ipcRenderer.invoke('cache:getCacheSize')
   },
   log: {
@@ -370,6 +450,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
     getModelStatus: () => ipcRenderer.invoke('stt:getModelStatus'),
     downloadModel: () => ipcRenderer.invoke('stt:downloadModel'),
     transcribe: (wavBase64: string, sessionId: string, createTime: number, force?: boolean) => ipcRenderer.invoke('stt:transcribe', wavBase64, sessionId, createTime, force),
+    testOnlineConfig: (overrides?: { provider?: 'openai-compatible' | 'aliyun-qwen-asr' | 'custom'; apiKey?: string; baseURL?: string; model?: string; language?: string; timeoutMs?: number }) =>
+      ipcRenderer.invoke('stt-online:test-config', overrides),
     onDownloadProgress: (callback: (progress: { modelName: string; downloadedBytes: number; totalBytes?: number; percent?: number }) => void) => {
       ipcRenderer.on('stt:downloadProgress', (_, progress) => callback(progress))
       return () => ipcRenderer.removeAllListeners('stt:downloadProgress')

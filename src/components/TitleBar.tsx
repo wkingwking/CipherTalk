@@ -1,49 +1,67 @@
-import { ReactNode, useEffect } from 'react'
+import { ReactNode } from 'react'
 import { RefreshCw } from 'lucide-react'
+import { usePlatformInfo } from '../hooks/usePlatformInfo'
 import { useTitleBarStore } from '../stores/titleBarStore'
 import { useUpdateStatusStore } from '../stores/updateStatusStore'
 import { useThemeStore } from '../stores/themeStore'
 import './TitleBar.scss'
 
 interface TitleBarProps {
+  className?: string
   rightContent?: ReactNode
   title?: string
+  variant?: 'app' | 'standalone'
 }
 
-function TitleBar({ rightContent, title }: TitleBarProps) {
+function TitleBar({ className, rightContent, title, variant = 'app' }: TitleBarProps) {
   const storeRightContent = useTitleBarStore(state => state.rightContent)
   const displayContent = rightContent ?? storeRightContent
   const isUpdating = useUpdateStatusStore(state => state.isUpdating)
   const appIcon = useThemeStore(state => state.appIcon)
+  const { isMac } = usePlatformInfo()
+  const titleBarClassName = ['title-bar', `variant-${variant}`, isMac ? 'is-mac' : 'is-win', className]
+    .filter(Boolean)
+    .join(' ')
 
-  // 调试：检查状态
-  useEffect(() => {
-    if (isUpdating) {
-      console.log('[TitleBar] 更新指示器显示')
-    }
-  }, [isUpdating])
+  const updateStatusNode = isUpdating ? (
+    <div className="update-status">
+      <RefreshCw
+        className="update-indicator"
+        size={16}
+        strokeWidth={2.5}
+      />
+      <span className="update-text">正在同步数据...</span>
+    </div>
+  ) : null
+
+  const titleNode = (
+    <>
+      <img src={appIcon === 'xinnian' ? "./xinnian.png" : "./logo.png"} alt="密语" className="title-logo" />
+      <span className="titles">{title || 'CipherTalk'}</span>
+    </>
+  )
 
   return (
-    <div className="title-bar">
+    <div className={titleBarClassName}>
       <div className="title-bar-left">
-        <img src={appIcon === 'xinnian' ? "./xinnian.png" : "./logo.png"} alt="密语" className="title-logo" />
-        <span className="titles">{title || 'CipherTalk'}</span>
-        {isUpdating && (
-          <div className="update-status">
-            <RefreshCw
-              className="update-indicator"
-              size={16}
-              strokeWidth={2.5}
-            />
-            <span className="update-text">正在同步数据...</span>
-          </div>
+        {isMac ? (
+          <div className="title-bar-traffic-spacer" aria-hidden="true" />
+        ) : (
+          <>
+            {titleNode}
+            {updateStatusNode}
+          </>
         )}
       </div>
-      {displayContent && (
-        <div className="title-bar-right">
-          {displayContent}
+      {isMac && (
+        <div className="title-bar-center">
+          {titleNode}
         </div>
       )}
+      <div className="title-bar-right">
+        {isMac && updateStatusNode}
+        {displayContent}
+      </div>
     </div>
   )
 }

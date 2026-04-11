@@ -1,34 +1,49 @@
 {
   "name": "ciphertalk",
-  "version": "2.2.14",
+  "version": "4.1.9",
   "description": "密语 - 微信聊天记录查看工具",
   "author": "ILoveBingLu",
   "license": "CC-BY-NC-SA-4.0",
   "main": "dist-electron/main.js",
   "scripts": {
     "dev": "vite",
-    "prebuild": "node scripts/update-readme-version.js",
-    "build:full": "node scripts/build-full.js",
+    "icon:mac": "bash scripts/build-macos-icon.sh",
+    "native:macos": "bash native-dlls/build-macos.sh",
+    "native:macos:check": "node scripts/check-macos-native.js",
+    "build:prepare:mac": "node scripts/patch-dmg-builder.cjs",
+    "build:prepare": "node scripts/update-readme-version.js && node scripts/prepare-release-announcement.js",
+    "prebuild": "node scripts/update-readme-version.js && node scripts/prepare-release-announcement.js",
     "build": "tsc && vite build && electron-builder && node scripts/add-size-to-yml.js",
+    "build:win": "npm run build:prepare && tsc && vite build && node scripts/run-electron-builder.cjs win && node scripts/generate-update-manifest.js win && node scripts/add-size-to-yml.js",
+    "build:mac": "npm run build:prepare && npm run native:macos:check && npm run build:prepare:mac && tsc && vite build && node scripts/run-electron-builder.cjs mac && node scripts/generate-update-manifest.js mac && node scripts/add-size-to-yml.js",
+    "build:ci": "node scripts/prepare-release-announcement.js && tsc && vite build && electron-builder --publish never && node scripts/generate-update-manifest.js && node scripts/add-size-to-yml.js",
     "build:mcp": "tsc && vite build",
-    "build:pro": "node scripts/build-full.js",
+    "build:force-update-manifest": "node scripts/generate-force-update-manifest.js",
+    "build:release-context": "node scripts/generate-release-context.js",
+    "build:release-body": "node scripts/generate-release-body.js",
+    "build:release-announcement": "node scripts/prepare-release-announcement.js",
+    "notify:telegram": "node scripts/send-telegram-release.js",
     "mcp": "node scripts/mcp-runner.js",
+    "mcp:probe": "node scripts/mcp-probe.js",
     "preview": "vite preview",
     "electron:dev": "vite --mode electron",
     "electron:build": "npm run build",
-    "postinstall": "electron-rebuild",
-    "tuisong": "node scripts/push-release.js"
+    "postinstall": "electron-rebuild"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.27.1",
     "@emotion/react": "^11.14.0",
     "@emotion/styled": "^11.14.1",
+    "@lobehub/fluent-emoji": "^4.1.0",
+    "@lobehub/icons": "^5.3.0",
+    "@lobehub/ui": "^5.6.5",
+    "@modelcontextprotocol/sdk": "^1.27.1",
     "@mui/material": "^7.3.9",
     "@types/dompurify": "^3.0.5",
     "@types/marked": "^5.0.2",
     "@types/react-virtualized-auto-sizer": "^1.0.4",
     "@types/react-window": "^1.8.8",
     "@xmldom/xmldom": "^0.9.6",
+    "antd": "^6.3.5",
     "better-sqlite3": "^12.5.0",
     "dom-to-image-more": "^3.7.2",
     "dompurify": "^3.3.1",
@@ -36,6 +51,7 @@
     "echarts-for-react": "^3.0.2",
     "electron-store": "^10.0.0",
     "electron-updater": "^6.3.9",
+    "es-toolkit": "^1.45.1",
     "ffmpeg-static": "^5.3.0",
     "fzstd": "^0.1.1",
     "html2canvas": "^1.4.1",
@@ -67,7 +83,7 @@
     "@types/react-dom": "^19.1.0",
     "@vitejs/plugin-react": "^4.3.4",
     "adm-zip": "^0.5.16",
-    "electron": "^39.2.7",
+    "electron": "^39.6.0",
     "electron-builder": "^25.1.8",
     "sass": "^1.83.0",
     "sharp": "^0.34.5",
@@ -87,13 +103,24 @@
       "output": "release"
     },
     "publish": {
-      "provider": "generic",
-      "url": "https://miyuapp.aiqji.com"
+      "provider": "github",
+      "owner": "ILoveBingLu",
+      "repo": "CipherTalk",
+      "publishAutoUpdate": false
     },
     "win": {
-      "icon": "public/xinnian.ico",
+      "icon": "public/icon.ico",
       "target": "nsis",
       "requestedExecutionLevel": "asInvoker"
+    },
+    "mac": {
+      "icon": "public/icon.icns",
+      "target": "dmg",
+      "category": "public.app-category.utilities",
+      "hardenedRuntime": true,
+      "gatekeeperAssess": false,
+      "entitlements": "resources/macos/entitlements.mac.plist",
+      "entitlementsInherit": "resources/macos/entitlements.mac.plist"
     },
     "nsis": {
       "differentialPackage": false,
@@ -108,9 +135,9 @@
       "language": "2052",
       "displayLanguageSelector": false,
       "include": "installer.nsh",
-      "installerIcon": "public/xinnian.ico",
-      "uninstallerIcon": "public/xinnian.ico",
-      "installerHeaderIcon": "public/xinnian.ico",
+      "installerIcon": "public/icon.ico",
+      "uninstallerIcon": "public/icon.ico",
+      "installerHeaderIcon": "public/icon.ico",
       "perMachine": false,
       "allowElevation": true,
       "installerSidebar": null,
@@ -139,15 +166,35 @@
       {
         "from": "public/xinnian.ico",
         "to": "xinnian.ico"
+      },
+      {
+        "from": ".tmp/release-announcement.json",
+        "to": "release-announcement.json"
+      },
+      {
+        "from": "sikll/ct-mcp-copilot",
+        "to": "builtin-skills/ct-mcp-copilot"
+      }
+    ],
+    "extraFiles": [
+      {
+        "from": "scripts/ciphertalk-mcp.cmd",
+        "to": "ciphertalk-mcp.cmd"
+      },
+      {
+        "from": "scripts/ciphertalk-mcp-bootstrap.cjs",
+        "to": "ciphertalk-mcp-bootstrap.cjs"
       }
     ],
     "files": [
       "dist/**/*",
       "dist-electron/**/*",
+      "sikll/**/*",
       "!node_modules/**/*.{txt,md,js.map,ts,html}",
       "!node_modules/**/test/**/*",
       "!node_modules/**/docs/**/*",
       "!node_modules/**/examples/**/*",
+      "!node_modules/.vite/**/*",
       "!node_modules/**/{linux,darwin,mac,android,ios,armhf,armv7l,ia32,wasm}/**/*",
       "!node_modules/**/*.so",
       "!node_modules/**/*.dylib",

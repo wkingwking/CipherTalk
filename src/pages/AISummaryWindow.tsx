@@ -3,14 +3,17 @@ import { Copy, Download, RefreshCw, Loader2, Send, ArrowLeft, Trash2, LoaderPinw
 import { marked } from 'marked'
 import DOMPurify from 'dompurify'
 import { TIME_RANGE_OPTIONS, type SummaryResult } from '../types/ai'
+import { usePlatformInfo } from '../hooks/usePlatformInfo'
+import AIProviderLogo from '../components/ai/AIProviderLogo'
 import './AISummaryWindow.scss'
 
 function AISummaryWindow() {
+  const { isMac } = usePlatformInfo()
   const [sessionId, setSessionId] = useState<string>('')
   const [sessionName, setSessionName] = useState<string>('')
   const [avatarUrl, setAvatarUrl] = useState<string>('')
-  const [aiProviderLogo, setAiProviderLogo] = useState<string>('')
-  const [resultProviderInfo, setResultProviderInfo] = useState<{ logo: string; displayName: string } | null>(null)
+  const [aiProviderInfo, setAiProviderInfo] = useState<{ id: string; logo: string; displayName: string } | null>(null)
+  const [resultProviderInfo, setResultProviderInfo] = useState<{ id: string; logo: string; displayName: string } | null>(null)
   const [timeRangeDays, setTimeRangeDays] = useState<number>(7)
   const [customDays, setCustomDays] = useState<string>('')
   const [customRequirement, setCustomRequirement] = useState<string>('')
@@ -91,8 +94,12 @@ function AISummaryWindow() {
       const providers = await getAIProviders()
       const providerInfo = providers.find(p => p.id === currentProvider)
       
-      if (providerInfo?.logo) {
-        setAiProviderLogo(providerInfo.logo)
+      if (providerInfo) {
+        setAiProviderInfo({
+          id: providerInfo.id,
+          logo: providerInfo.logo || '',
+          displayName: providerInfo.displayName
+        })
       }
     } catch (e) {
       console.error('加载 AI 提供商 logo 失败:', e)
@@ -108,6 +115,7 @@ function AISummaryWindow() {
       
       if (providerInfo) {
         setResultProviderInfo({
+          id: providerInfo.id,
           logo: providerInfo.logo || '',
           displayName: providerInfo.displayName
         })
@@ -357,27 +365,37 @@ function AISummaryWindow() {
   }
 
   return (
-    <div className="ai-summary-window">
+    <div className={`ai-summary-window ${isMac ? 'is-mac' : 'is-win'}`}>
       {/* 自定义标题栏 */}
       <div className="title-bar">
-        <div className="title-content">
-          {avatarUrl && (
-            <img src={avatarUrl} alt="" className="session-avatar" />
+        {isMac && <div className="title-bar-leading-spacer" aria-hidden="true" />}
+
+        <div className="title-bar-center">
+          <div className="title-content">
+            {avatarUrl && (
+              <img src={avatarUrl} alt="" className="session-avatar" />
+            )}
+            {aiProviderInfo && (
+              <>
+                <span className="multiply-symbol">×</span>
+                <div className="ai-provider-badge">
+                  <AIProviderLogo
+                    providerId={aiProviderInfo.id}
+                    logo={aiProviderInfo.logo}
+                    alt={aiProviderInfo.displayName}
+                    className="ai-provider-logo"
+                    size={24}
+                  />
+                </div>
+              </>
+            )}
+            <span className="session-name">{sessionName}</span>
+          </div>
+
+          {result && (
+            <span className="message-count">{result.messageCount}条</span>
           )}
-          {aiProviderLogo && (
-            <>
-              <span className="multiply-symbol">×</span>
-              <div className="ai-provider-badge">
-                <img src={aiProviderLogo} alt="AI" className="ai-provider-logo" />
-              </div>
-            </>
-          )}
-          <span className="session-name">{sessionName}</span>
         </div>
-        
-        {result && (
-          <span className="message-count">{result.messageCount}条</span>
-        )}
 
         <div className="title-actions">
           {isGenerating && (
@@ -661,7 +679,12 @@ function AISummaryWindow() {
                         <div className="disclaimer-content">
                           {resultProviderInfo.logo && (
                             <div className="ai-provider-badge-small">
-                              <img src={resultProviderInfo.logo} alt="AI" />
+                              <AIProviderLogo
+                                providerId={resultProviderInfo.id}
+                                logo={resultProviderInfo.logo}
+                                alt={resultProviderInfo.displayName}
+                                size={20}
+                              />
                             </div>
                           )}
                           <span className="disclaimer-text">
